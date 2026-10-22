@@ -1,0 +1,3 @@
+concurrency,mtp_width,native_operator_launches,native_kernel_launches,fallback_state_copy_launches,fallback_recurrent_launches,fallback_gated_rmsnorm_launches,fallback_total_launches,native_profiled_device_us
+1,3,1,1,5,1,1,7,37.44
+16,3,1,1,5,1,1,7,103.76

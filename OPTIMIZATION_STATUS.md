@@ -14,7 +14,7 @@ Updated: 2026-10-22
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
 | P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | V1 raises KV to 272K but 16K/c16 falls to ~1.70 tok/s; v2 leaves 210,751 tokens but loses 4.8% c1 and 6.7% long decode | V1/V2 rejected; redesign scoped | Recover KV capacity without >3% decode loss or long-context collapse |
 | P1 | TP communication / all-reduce | `opt/tp-communication` | Rank1 NCCL wait dominates eager profile; only PYNCCL is active | Planned | ≥10% TP2 decode gain or prove topology limit |
-| P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode` | CUDA-only kernel/CMake path isolated; ROCm image lacks `fused_gdn_decode_post_conv_mtp`, so 48/64 layers use Triton | HIP port scoped | Fused path selected and ≥5% E2E gain |
+| P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode-hip` | Full HIP build, 480/480 reference cases, ragged/bounds guards and HIP Graph pass; real N=2 profile falls from 7 launches to 1 and c1 microbench is 5.78x faster | Micro-validated; E2E infra-blocked by PyNccl init | Prove native selector hit, then re-run same-pair candidate/stock and demonstrate ≥5% E2E gain |
 | P1 | Long-context attention/prefill | `opt/longctx-attention` | 16K batch16 baseline p99 E2E is ~604 s; EAGLE worsens residency pressure | Planned | ≥15% 16K throughput gain with p99 non-regression |
 | P2 | KV-cache capacity/precision | `opt/kv-cache` | EAGLE model+graphs reduce available KV cache; long-context concurrency collapses | Planned | More resident 16K requests with accuracy gate |
 
@@ -74,9 +74,15 @@ V2 captures every batch size 1–16 plus each verification multiple through 48 (
 
 The eager target profile shows similar GEMM time across ranks but far higher NCCL time on rank1. W7900 uses PYNCCL here; custom/AITER all-reduce is unavailable. Compare TP2 with a feasible TP1/PP2 control, then test fused GEMM+reduce and overlap. Treat GPU6/7 separately: that pair fails PYNCCL initialization with `HIP invalid argument`, while GPU0/1, 2/3, and 4/5 work.
 
-### `opt/gdn-fused-decode`
+### `opt/gdn-fused-decode-hip`
 
-Qwen3.8 contains 48 GDN and 16 full-attention layers. On gfx1100, `fused_gdn_decode_post_conv_mtp` is not compiled and the runtime falls back to Triton. The source exists at `csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu`, but CMake registers it only in the CUDA build for CUDA 13 architecture sets; the Python eligibility path also selects `gdn_decode_kernel == "cuda"`. This is a real HIP port: state update, convolution, gated RMSNorm, MTP state indices, wave-size-safe reductions, ROCm build registration, and BF16/FP32 parity tests are all required before performance testing.
+The gfx1100 HIP port now compiles and registers through the full stable extension. It replaces CUDA-only async copies and BF16/runtime intrinsics while retaining explicit width-32 logical reductions. Correctness covers 480 combinations of MTP width, GQA ratio, state/norm dtype, `dt_bias` dtype, and activation, plus ragged accepted-token and bounds guards; FP32/BF16 HIP Graph replay is bit-exact. Width-32 shuffles are designed for wave64 subgroup safety, but only the default gfx1100 wave mode has been run.
+
+At the real Qwen3.8 TP2-local head shape, the native kernel replaces seven fallback launches with one. After the reviewed bounds and alignment changes it is 5.78x faster at batch1/N=3 and 1.31x at batch16/N=3, but regresses above the selector gate, so gfx1100 dispatch is limited to at most 16 requests and 48 actual tokens.
+
+Service A/B remains blocked. Clean GPU2/3 and GPU0/1 starts both failed in PyNccl `ncclCommInitRank` with HIP `invalid argument`, before model loading or any patched forward. Do not interpret this as a kernel failure or claim an end-to-end gain. Re-run candidate and stock serially on a healthy TP2 pair before promotion; see `experiments/gdn-fused-decode/README.md`.
+
+A future service run must also confirm the native operator was selected: eligible ROCm layouts may take the AITER fast path and bypass this kernel.
 
 ### `opt/longctx-attention`
 

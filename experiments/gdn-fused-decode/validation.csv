@@ -1,0 +1,18 @@
+stage,result,detail
+minimal_gfx1100_object,pass,"hipcc release object, 564 KiB"
+private_operator_link,pass,"registered _gdn_hip_test.fused_gdn_decode_post_conv_mtp"
+full_stable_extension_build,pass,"reviewed rebuild succeeded; gfx1100 object linked"
+full_operator_registration,pass,"torch.ops._C.fused_gdn_decode_post_conv_mtp present"
+reference_correctness,pass,"480/480; N=1/2/3/5; GQA=1/2/3/4/8; FP32/BF16 state and norm; FP32/BF16/FP16 dt_bias; SiLU/sigmoid"
+reference_max_output_relative_l2,pass,0.00023312281700782478
+reference_max_state_abs_error,pass,0.0009765625
+ragged_accepted_tokens,pass,"query lengths 4/2/0; accepted counts 1/2/4; all dt_bias dtypes"
+guard_tokens_exceed_width,pass,"zero output and no state mutation"
+guard_source_slot_oob,pass,"zero output and no state mutation"
+guard_destination_slot_oob,pass,"invalid destination skipped; valid destination updated; no illegal access"
+hip_graph_fp32_state,pass,"capture once; 2 replays; output/state bit-exact"
+hip_graph_bf16_state,pass,"capture once; 2 replays; output/state bit-exact"
+profile_n2_c1,pass,"native 1 launch; fallback 7 launches"
+profile_n2_c16,pass,"native 1 launch; fallback 7 launches"
+service_gpu2_3,infra_blocked,"PyNccl ncclCommInitRank: unhandled cuda error / HIP invalid argument before model load"
+service_gpu0_1,infra_blocked,"PyNccl ncclCommInitRank: unhandled cuda error / HIP invalid argument before model load"

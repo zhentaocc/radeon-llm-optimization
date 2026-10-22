@@ -1,0 +1,86 @@
+{
+  "arch": "gfx1100",
+  "cases": 480,
+  "device": "AMD Radeon Graphics",
+  "hip_graph": [
+    {
+      "capture": true,
+      "replays": [
+        {
+          "bit_exact": true,
+          "replay": 1
+        },
+        {
+          "bit_exact": true,
+          "replay": 2
+        }
+      ],
+      "state_dtype": "torch.float32"
+    },
+    {
+      "capture": true,
+      "replays": [
+        {
+          "bit_exact": true,
+          "replay": 1
+        },
+        {
+          "bit_exact": true,
+          "replay": 2
+        }
+      ],
+      "state_dtype": "torch.bfloat16"
+    }
+  ],
+  "max_output_relative_l2": 0.00023312281700782478,
+  "max_state_abs_error": 0.0009765625,
+  "negative_guards": {
+    "destination_slot_oob": true,
+    "source_slot_oob": true,
+    "tokens_exceed_width": true
+  },
+  "ragged": [
+    {
+      "accepted_steps": [
+        1,
+        2,
+        4
+      ],
+      "dt_bias_dtype": "torch.float32",
+      "max_output_relative_l2": 0.000372264941688627,
+      "query_lengths": [
+        4,
+        2,
+        0
+      ]
+    },
+    {
+      "accepted_steps": [
+        1,
+        2,
+        4
+      ],
+      "dt_bias_dtype": "torch.bfloat16",
+      "max_output_relative_l2": 5.678165325662121e-05,
+      "query_lengths": [
+        4,
+        2,
+        0
+      ]
+    },
+    {
+      "accepted_steps": [
+        1,
+        2,
+        4
+      ],
+      "dt_bias_dtype": "torch.float16",
+      "max_output_relative_l2": 8.766738801568863e-07,
+      "query_lengths": [
+        4,
+        2,
+        0
+      ]
+    }
+  ]
+}
