@@ -1,0 +1,8 @@
+tokens,stock_us,fused_us,speedup,device,status
+1,29.229,9.754,2.997,W7900D-gfx1100,micro-validated
+2,29.243,9.732,3.005,W7900D-gfx1100,micro-validated
+4,29.305,9.842,2.977,W7900D-gfx1100,micro-validated
+8,29.318,10.213,2.871,W7900D-gfx1100,micro-validated
+16,30.013,10.627,2.824,W7900D-gfx1100,micro-validated
+32,32.456,11.586,2.801,W7900D-gfx1100,micro-validated
+64,37.102,14.311,2.593,W7900D-gfx1100,micro-validated
