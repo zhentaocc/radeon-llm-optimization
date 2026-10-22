@@ -7,7 +7,7 @@ Updated: 2026-10-22
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
-| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Shape sweep and 13 tests pass, but strict same-GPU A/B is -20.9% c1, -2.4% c16, and -13.3% long decode | Rejected; negative result retained | Rework around production graph/profile data; candidate must beat stock c1 |
+| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Broad patch is -20.9% c1; isolation finds draft-QKV alone -14.4% while target-QKV median is -1.1% | Existing-backend switching exhausted; negative result retained | Implement graph-friendly RDNA/fused draft kernel; candidate must beat stock c1 |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
@@ -32,7 +32,9 @@ Direct W7900 microbenchmarks show that the current blanket `n<=5` dispatch is wr
 
 The branch patch keeps CDNA behavior unchanged and, on RDNA, uses `wvSplitK` only when `max(m,k)>=11264`, limits LLMM1 to single-token K≤4096, and otherwise falls through to torch/hipBLASLt. The exact v0.29.0 test file passes 13/13 cases in the production ROCm image.
 
-The strict end-to-end gate rejects it. Patched versus stock on the same recovered GPU0/1 pair is 26.04 versus 32.92 tok/s for 128/128 c1 (-20.9%), 169.43 versus 173.60 for c16 (-2.4%), and 24.39 versus 28.12 for 512/512 c1 (-13.3%). The isolated eager GEMM crossover does not carry into compiled graph replay, and the generic torch path is particularly costly at c1. Keep the branch as a reproducible negative result. The next attempt needs profiler-observed production shapes and an in-graph kernel/backend path; it must beat stock c1 before any full-matrix run.
+The strict end-to-end gate rejects it. Patched versus stock on the same recovered GPU0/1 pair is 26.04 versus 32.92 tok/s for 128/128 c1 (-20.9%), 169.43 versus 173.60 for c16 (-2.4%), and 24.39 versus 28.12 for 512/512 c1 (-13.3%). The isolated eager GEMM crossover does not carry into compiled graph replay, and the generic torch path is particularly costly at c1.
+
+Exact-shape isolation closes the remaining threshold question. Target+draft QKV reaches 27.62 tok/s (-16.1%); draft QKV alone reaches 28.18 (-14.4%); target QKV alone produces 32.57/33.01/30.74 with a 32.57 median (-1.1%), so it has no reproducible gain. Draft QKV explains most of the regression. Keep the branch as a reproducible negative result; switching among existing backends is exhausted. The next attempt must implement a graph-friendly RDNA kernel or fused draft projection and beat stock c1 before any full-matrix run.
 
 ### `opt/eagle-fusion`: norm and MLP fusion
 

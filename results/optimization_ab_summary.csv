@@ -5,3 +5,6 @@ hip_graph_v2,512/512,1,26.23,28.12,-6.7,reject
 smallm_shape_dispatch,128/128,1,26.04,32.92,-20.9,reject
 smallm_shape_dispatch,128/128,16,169.43,173.60,-2.4,pass_cell
 smallm_shape_dispatch,512/512,1,24.39,28.12,-13.3,reject
+smallm_qkv_combined,128/128,1,27.62,32.92,-16.1,reject
+smallm_draft_qkv,128/128,1,28.18,32.92,-14.4,reject
+smallm_target_qkv_median,128/128,1,32.57,32.92,-1.1,no_reproducible_gain

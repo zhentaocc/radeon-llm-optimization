@@ -91,6 +91,8 @@ A v0.29.0 patch uses `wvSplitK` on RDNA only when `max(m,k)>=11264`, restricts L
 
 The isolated eager microbenchmark is not a sufficient dispatch oracle for compiled graph replay. Retain the branch as a negative result. Re-profile the production graph path and implement a backend-specific in-graph candidate before revisiting this optimization.
 
+Exact QKV isolation confirms where it fails. Routing target+draft QKV to torch gives 27.62 tok/s (-16.1%); draft QKV alone gives 28.18 (-14.4%); target QKV alone has a three-run median of 32.57 (-1.1%, with runs 32.57/33.01/30.74). The draft projection accounts for most of the loss, while target-only has no reproducible win. Existing-backend/threshold tuning is therefore exhausted; the actionable next step is a graph-friendly RDNA draft-QKV kernel or fusion with adjacent norm/rope/layout work.
+
 ### Fusion audit
 
 Two originally proposed fusion tasks are already present. Qwen3.8 calls `Qwen3NextRMSNorm(hidden_states, residual)` and the runtime selects the native fused-add RMSNorm path; its dense MLP uses a merged gate/up projection followed by `SiluAndMul()`. Full attention also has a fused gated split + QK-RMSNorm + partial RoPE path. The remaining fusion work should therefore focus on RMSNorm+QKV/GDN projection, post-attention RMSNorm+gate/up projection, EAGLE auxiliary hidden-state preparation, and the 48-layer GDN state/convolution/norm path.

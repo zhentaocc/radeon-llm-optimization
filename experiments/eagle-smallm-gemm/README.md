@@ -39,3 +39,16 @@ After stale TP contexts were cleared, patched and stock services were run serial
 | 512/512 c1 | 24.39 | 28.12 | -13.3% |
 
 The patch is a useful negative result, not a PR candidate. Isolated eager GEMM latency does not predict compiled graph-replay performance, and replacing several small projections with the generic torch path is especially costly at c1. Keep the branch and raw data for reproducibility, but rework the optimization around profiler-observed production shapes and an in-graph backend/kernel implementation. Any next candidate must first beat stock on c1 before running the full matrix.
+
+## QKV isolation
+
+The c1 regression was isolated with exact `(output_dim, input_dim)` allowlists while every other shape stayed on stock `wvSplitK`:
+
+| Candidate | 128/128 c1 tok/s | Delta vs stock |
+|---|---:|---:|
+| Stock | 32.92 | - |
+| Target + draft QKV | 27.62 | -16.1% |
+| Draft QKV only `(8192,5120)` | 28.18 | -14.4% |
+| Target QKV only `(4096,5120)`, 3-run median | 32.57 | -1.1% |
+
+The target-only runs were 32.57, 33.01, and 30.74 tok/s; their median does not establish a gain. Draft QKV accounts for most of the regression even though its isolated eager GEMM favored torch/hipBLASLt. This closes the backend-switch/threshold direction: further work requires a graph-friendly RDNA kernel or fused draft projection, not another dispatch allowlist.
