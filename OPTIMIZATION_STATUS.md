@@ -7,14 +7,14 @@ Updated: 2026-10-22
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
-| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Shape sweep finds blanket `wvSplitK` loses 7–23% on QKV/O/target-down but wins 1.7–3.0× on large MLP; shape-aware patch passes 13 tests | Patch ready; E2E gate blocked by host PYNCCL state | ≥10% decode throughput gain, no matrix regression |
-| P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Thousands of norm, copy and elementwise launches; fusion flags are disabled in current graph | Planned | ≥8% batch-1 TPOT improvement |
+| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Shape sweep and 13 tests pass, but strict same-GPU A/B is -20.9% c1, -2.4% c16, and -13.3% long decode | Rejected; negative result retained | Rework around production graph/profile data; candidate must beat stock c1 |
+| P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
-| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | V1 cuts graph memory 7.3→1.86 GiB/rank and raises KV ~125K→272K, but misses verification shape 3 and loses 4.4% c1 versus same-period control; v2 covers all batch/verify shapes | V2 pending PYNCCL recovery; 16K gate running | Recover KV capacity without >3% decode loss |
+| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | V1 raises KV to 272K but 16K/c16 falls to ~1.70 tok/s; v2 leaves 210,751 tokens but loses 4.8% c1 and 6.7% long decode | V1/V2 rejected; redesign scoped | Recover KV capacity without >3% decode loss or long-context collapse |
 | P1 | TP communication / all-reduce | `opt/tp-communication` | Rank1 NCCL wait dominates eager profile; only PYNCCL is active | Planned | ≥10% TP2 decode gain or prove topology limit |
-| P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode` | Fused GDN MTP op is unavailable; Triton fallback is active | Planned | Fused path selected and ≥5% E2E gain |
+| P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode` | CUDA-only kernel/CMake path isolated; ROCm image lacks `fused_gdn_decode_post_conv_mtp`, so 48/64 layers use Triton | HIP port scoped | Fused path selected and ≥5% E2E gain |
 | P1 | Long-context attention/prefill | `opt/longctx-attention` | 16K batch16 baseline p99 E2E is ~604 s; EAGLE worsens residency pressure | Planned | ≥15% 16K throughput gain with p99 non-regression |
 | P2 | KV-cache capacity/precision | `opt/kv-cache` | EAGLE model+graphs reduce available KV cache; long-context concurrency collapses | Planned | More resident 16K requests with accuracy gate |
 
@@ -30,18 +30,15 @@ The workload is dominated by small-M linear algebra during autoregressive decode
 
 Direct W7900 microbenchmarks show that the current blanket `n<=5` dispatch is wrong. `wvSplitK` is about 1.7× faster for target MLP-up, 3.0× for draft MLP-up, 1.24–1.34× for draft MLP-down, and 1.76–1.94× for the TP-local LM head. It is 7–23% slower for target/draft QKV and O projections and 8–16% slower for target MLP-down. A threshold sweep places the crossover between output dimensions 10,240 and 11,264 for K=5120.
 
-The branch patch keeps CDNA behavior unchanged and, on RDNA, uses `wvSplitK` only when `max(m,k)>=11264`, limits LLMM1 to single-token K≤4096, and otherwise falls through to torch/hipBLASLt. The exact v0.29.0 test file passes 13/13 cases in the production ROCm image. End-to-end service validation awaits a host/GPU reset: PyNCCL fails during communicator initialization, while the torch.distributed fallback loads the model and then fails at its first all-reduce with the same `hipIpcGetMemHandle` error.
+The branch patch keeps CDNA behavior unchanged and, on RDNA, uses `wvSplitK` only when `max(m,k)>=11264`, limits LLMM1 to single-token K≤4096, and otherwise falls through to torch/hipBLASLt. The exact v0.29.0 test file passes 13/13 cases in the production ROCm image.
 
-Remaining gate:
-
-- launch patched and stock services on the same healthy GPU pair;
-- repeat 128/128 c1/c16 and 512/512 c1 at least three times;
-- profile kernel counts to confirm small projections moved off `wvSplitK`;
-- gate on the full matrix before promotion.
+The strict end-to-end gate rejects it. Patched versus stock on the same recovered GPU0/1 pair is 26.04 versus 32.92 tok/s for 128/128 c1 (-20.9%), 169.43 versus 173.60 for c16 (-2.4%), and 24.39 versus 28.12 for 512/512 c1 (-13.3%). The isolated eager GEMM crossover does not carry into compiled graph replay, and the generic torch path is particularly costly at c1. Keep the branch as a reproducible negative result. The next attempt needs profiler-observed production shapes and an in-graph kernel/backend path; it must beat stock c1 before any full-matrix run.
 
 ### `opt/eagle-fusion`: norm and MLP fusion
 
-The current compile configuration reports `fuse_norm_quant=false`, `fuse_act_quant=false`, `fuse_gemm_comms=false`, and no QK-norm/rope fusion. The profile also shows roughly 1,610 RMSNorm reductions per ten steps plus many BF16/FP32 copies and elementwise kernels. Highest-value candidates are `residual + RMSNorm`, `RMSNorm + QKV/GDN projection`, and `gate + SiLU + mul`; for EAGLE, fuse auxiliary hidden-state projection/concatenation where layout permits.
+The profile shows roughly 1,610 RMSNorm reductions per ten steps plus many BF16/FP32 copies and elementwise kernels, but a source/runtime audit narrows the missing work. `Qwen3NextRMSNorm(hidden_states, residual)` already uses native fused-add RMSNorm; dense Qwen3.8 MLP already feeds a merged gate/up projection into `SiluAndMul`; and full attention already has a fused gated split + QK-RMSNorm + partial RoPE path. The disabled compile flags are quantization/fusion passes, not evidence that these model-level fusions are absent.
+
+The actionable boundaries are RMSNorm+QKV/GDN projection, post-attention RMSNorm+gate/up projection, and EAGLE auxiliary hidden-state gather/projection/concatenation. For the 48 GDN layers, fused state update/convolution/norm is likely higher value than another generic MLP activation kernel.
 
 ### `fix/eagle-dynamic-n`: scheduler/graph correctness
 
@@ -67,7 +64,9 @@ Static EAGLE3 already captures and replays HIP/CUDA graphs in this build; “add
 
 The first set misses shape `3`, which is the N=2 verification shape for c1. Its 128/128 c1 results are 31.67, 30.98, and 31.42 tok/s; a same-period default repeat reaches 32.88, so the median loss is 4.4% and fails the gate. C16 is 200.30 versus 204.23 tok/s (−1.9%), and 512/512 c1 is 27.95 tok/s (+0.3% versus the earlier tuning control).
 
-V2 captures every batch size 1–16 plus each verification multiple through 48 (`1..16,18,21,...,48,56,64`). That should restore full-graph execution throughout the deployed range while still reducing the 54-shape default. New TP2 launches are blocked by a host HIP IPC failure under both PyNCCL and torch.distributed and require a host/GPU reset. The v1 16K/c16 residency test remains in progress on the already-running service.
+The v1 16K/c16 residency test was stopped after 16/32 requests and 2,413 seconds: 4,096 output tokens imply about 1.70 tok/s, 61.9% below the completed default EAGLE result. More KV capacity did not prevent decode starvation, so v1 is rejected.
+
+V2 captures every batch size 1–16 plus each verification multiple through 48 (`1..16,18,21,...,48,56,64`). After stale TP contexts were cleared, it started successfully with 4.26 GiB graph memory/rank, 210,751 KV tokens, and 6.43x theoretical 32K concurrency. Against a same-period default control it reaches 31.33 versus 32.92 tok/s at 128/128 c1 (-4.8%), 173.11 versus 173.60 at c16 (-0.3%), and 26.23 versus 28.12 at 512/512 c1 (-6.7%). V2 passes only the c16 gate. Redesign capture selection from scheduler telemetry and explicitly protect latency-critical c1/long-decode shapes; do not promote either fixed set.
 
 ### `opt/tp-communication`
 
@@ -75,7 +74,7 @@ The eager target profile shows similar GEMM time across ranks but far higher NCC
 
 ### `opt/gdn-fused-decode`
 
-Qwen3.8 contains 48 GDN and 16 full-attention layers. On gfx1100, `fused_gdn_decode_post_conv_mtp` is not compiled and the runtime falls back to Triton. Port/build the fused state-update, gated-delta, convolution and norm path for RDNA, then verify numerical parity before performance testing.
+Qwen3.8 contains 48 GDN and 16 full-attention layers. On gfx1100, `fused_gdn_decode_post_conv_mtp` is not compiled and the runtime falls back to Triton. The source exists at `csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu`, but CMake registers it only in the CUDA build for CUDA 13 architecture sets; the Python eligibility path also selects `gdn_decode_kernel == "cuda"`. This is a real HIP port: state update, convolution, gated RMSNorm, MTP state indices, wave-size-safe reductions, ROCm build registration, and BF16/FP32 parity tests are all required before performance testing.
 
 ### `opt/longctx-attention`
 

@@ -1,6 +1,6 @@
 # Shape-aware RDNA small-M GEMM dispatch
 
-Status: patch and microbenchmark validated; end-to-end service gate pending host PYNCCL recovery.
+Status: microbenchmark and unit tests pass, but strict same-GPU end-to-end A/B rejects the dispatch policy.
 
 ## Finding
 
@@ -30,4 +30,12 @@ The output-dimension sweep places the W7900 crossover between 10,240 and 11,264 
 - Source commit: `6562a7e` in the local vLLM branch `opt/eagle-smallm-gemm`.
 - Patch: `vllm-v0.29.0.patch`.
 
-The full EAGLE server A/B is blocked temporarily because new TP2 communicators on GPU0/1 and GPU2/3 fail with `hipIpcGetMemHandle failed: invalid argument`; those pairs completed earlier matrices successfully. Disabling PyNCCL lets model loading finish, but torch.distributed hits the identical HIP IPC failure at its first all-reduce during memory profiling. Recovery requires a host/GPU driver reset. Do not attribute this host-state failure to the patch.
+After stale TP contexts were cleared, patched and stock services were run serially on the same GPU0/1 pair with identical N=2, draft-TP1, graph, scheduler, and memory settings.
+
+| Workload | Patched tok/s | Stock tok/s | Delta |
+|---|---:|---:|---:|
+| 128/128 c1 | 26.04 | 32.92 | -20.9% |
+| 128/128 c16 | 169.43 | 173.60 | -2.4% |
+| 512/512 c1 | 24.39 | 28.12 | -13.3% |
+
+The patch is a useful negative result, not a PR candidate. Isolated eager GEMM latency does not predict compiled graph-replay performance, and replacing several small projections with the generic torch path is especially costly at c1. Keep the branch and raw data for reproducibility, but rework the optimization around profiler-observed production shapes and an in-graph backend/kernel implementation. Any next candidate must first beat stock on c1 before running the full matrix.

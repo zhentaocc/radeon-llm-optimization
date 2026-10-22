@@ -10,7 +10,8 @@ Status: EAGLE3 functional/performance matrix, parameter sweep, and strict identi
 - The optimization is workload-sensitive. For 16K/256 it is +128% at c1 but −21% at c4 and −58% at c16; speculation must be disabled or routed away for high-concurrency long-prefill traffic.
 - N=3 is best for low concurrency; N=2 is best for high concurrency. N=5/7 consistently lose because additional draft/verification cost grows faster than accepted-token length.
 - Draft TP2 gives a narrow +3.6% win for short c1, but loses 1–3% on long output/high batch. Draft TP1 remains the default.
-- Static EAGLE3 already uses HIP graphs. An 11-shape prototype cuts graph memory from ~7.3 to ~1.86 GiB/rank and raises KV capacity from ~125K to 272K tokens, but misses the c1 verification shape and needs one more iteration before promotion.
+- Static EAGLE3 already uses HIP graphs. V1 raises KV capacity to 272K tokens but collapses on 16K/c16; v2 retains 210,751 tokens but loses 4.8% at c1 and 6.7% on long decode. Neither fixed capture set is promotable.
+- A shape-aware small-M dispatch passes isolated microbenchmarks and 13 unit tests but fails strict same-GPU A/B (-20.9% c1, -13.3% long decode). It is retained as a negative result, not an upstream candidate.
 - Dynamic per-batch N now starts after a one-line graph-manager guard and a regression test, but it is not performance-ready: piecewise graph mode loses 15.5% at c16 versus static N=2.
 
 ## Environment and methodology
@@ -72,13 +73,29 @@ For the deployed maximum concurrency 16 and static N=2, the capture set `[1,2,4,
 
 The prototype reaches 31.67/30.98/31.42 tok/s across three 128/128 c1 runs, but a same-period default repeat is 32.88 tok/s, so the median loss is 4.4%. The cause is deterministic: static N=2 verifies three tokens for c1 and shape `3` was omitted, forcing piecewise execution. C16 is within 1.9% of its same-period control and 512/512 c1 is neutral.
 
-V2 covers every active batch size 1–16 and every N=2 verification multiple through 48 (`1..16,18,21,...,48,56,64`). New TP2 launches are blocked by `hipIpcGetMemHandle failed: invalid argument`: PyNCCL fails during communicator initialization, and the torch.distributed fallback loads the model but fails at its first all-reduce. The v1 16K/c16 residency gate continues on the already-running service; after a host/GPU reset, promotion requires v2 to stay within 3% at c1/c4/c16.
+The v1 16K/c16 gate was stopped after 16/32 requests and 2,413 seconds. Its 4,096 generated tokens imply about 1.70 tok/s, 61.9% below the completed default result, so the configuration is rejected despite the memory gain.
+
+V2 covers every active batch size 1–16 and every N=2 verification multiple through 48 (`1..16,18,21,...,48,56,64`). It starts after stale TP contexts are cleared, uses 4.26 GiB graph memory/rank, and leaves 210,751 KV tokens (6.43x theoretical 32K concurrency), versus 6.64 GiB and 150,241 tokens (4.59x) for the same N=2 default control. Throughput is 31.33/173.11/26.23 tok/s for short c1, short c16, and 512/512 c1, versus 32.92/173.60/28.12 for the same-period default. V2 passes c16 but fails the 3% gate at c1 (-4.8%) and long decode (-6.7%). The next version should use scheduler-observed shape residency instead of a static arithmetic list.
 
 ### Shape-aware small-M GEMM dispatch
 
 The target profile's 2,314 `wvSplitK_hf_sml` launches account for about 54% of classified rank-0 kernel time, but direct W7900 microbenchmarks show that the current `n<=5` rule is too broad. Large MLP/LM-head shapes benefit strongly from `wvSplitK` (1.24–3.0×), while target/draft QKV, O projection, and target MLP-down are 7–23% faster through torch/hipBLASLt. The crossover for K=5120 is between output dimensions 10,240 and 11,264.
 
-A v0.29.0 patch now uses `wvSplitK` on RDNA only when `max(m,k)>=11264`, restricts LLMM1 to single-token K≤4096, and leaves CDNA unchanged. The production ROCm image passes all 13 affected unit tests. Full server A/B is pending a host/GPU reset; both PyNCCL and torch.distributed reproduce the same HIP IPC failure independently of the patch.
+A v0.29.0 patch uses `wvSplitK` on RDNA only when `max(m,k)>=11264`, restricts LLMM1 to single-token K≤4096, and leaves CDNA unchanged. The production ROCm image passes all 13 affected unit tests, but the strict same-GPU service A/B rejects it:
+
+| Workload | Patched tok/s | Stock tok/s | Delta |
+|---|---:|---:|---:|
+| 128/128 c1 | 26.04 | 32.92 | -20.9% |
+| 128/128 c16 | 169.43 | 173.60 | -2.4% |
+| 512/512 c1 | 24.39 | 28.12 | -13.3% |
+
+The isolated eager microbenchmark is not a sufficient dispatch oracle for compiled graph replay. Retain the branch as a negative result. Re-profile the production graph path and implement a backend-specific in-graph candidate before revisiting this optimization.
+
+### Fusion audit
+
+Two originally proposed fusion tasks are already present. Qwen3.8 calls `Qwen3NextRMSNorm(hidden_states, residual)` and the runtime selects the native fused-add RMSNorm path; its dense MLP uses a merged gate/up projection followed by `SiluAndMul()`. Full attention also has a fused gated split + QK-RMSNorm + partial RoPE path. The remaining fusion work should therefore focus on RMSNorm+QKV/GDN projection, post-attention RMSNorm+gate/up projection, EAGLE auxiliary hidden-state preparation, and the 48-layer GDN state/convolution/norm path.
+
+The GDN gap is not a flag: `fused_gdn_decode_kernel.cu` is registered only in the CUDA/CUDA-13 build path, and the ROCm wheel does not expose `fused_gdn_decode_post_conv_mtp`. Enabling it on W7900 requires a HIP port with wave-safe reductions, ROCm build registration, and recurrent-state/MTP parity coverage.
 
 ## Dynamic N: correctness fixed, performance rejected
 
@@ -98,8 +115,8 @@ Two schedules were measured after the fix. `[[1,4,3],[5,64,2]]` reaches 36.05/15
 ### P0
 
 1. Restore full-graph-equivalent performance for dynamic N; correctness and startup coverage are complete.
-2. Optimize small-M BF16 GEMM/GEMV for draft N and target verification shapes; add N/batch-aware dispatch.
-3. Fuse residual+RMSNorm, RMSNorm+projection, gate+SiLU+mul, and EAGLE auxiliary-state preparation.
+2. Re-profile small-M BF16 GEMM/GEMV inside production graph replay; do not use the rejected eager-microbenchmark threshold policy.
+3. Fuse RMSNorm+projection and EAGLE auxiliary-state preparation; residual+RMSNorm and gate+SiLU+mul are already fused at the model/runtime boundary.
 4. Route or disable speculation for 16K traffic at concurrency ≥4.
 
 ### P1
