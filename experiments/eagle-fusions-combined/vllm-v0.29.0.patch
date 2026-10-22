@@ -1,0 +1,1016 @@
+From 423d465396ecd6355afc50b20cbe422ed0a6ce3d Mon Sep 17 00:00:00 2001
+From: zhenchen <zhenchen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 14:41:43 +0800
+Subject: [PATCH 1/2] Fuse Qwen3 EAGLE auxiliary RMSNorm preparation
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+
+Signed-off-by: zhenchen <zhenchen@users.noreply.github.com>
+---
+ .../kernels/benchmark_eagle_aux_rmsnorm.py    |  68 +++++++++
+ .../kernels/profile_eagle_aux_rmsnorm.py      |  63 +++++++++
+ tests/kernels/test_eagle_aux_rmsnorm.py       | 132 ++++++++++++++++++
+ .../layers/eagle_aux_rmsnorm.py               | 106 ++++++++++++++
+ vllm/model_executor/models/qwen3_eagle3.py    |  29 +++-
+ vllm/v1/spec_decode/llm_base_proposer.py      |  10 +-
+ vllm/v1/worker/gpu_model_runner.py            |  33 ++++-
+ 7 files changed, 433 insertions(+), 8 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_eagle_aux_rmsnorm.py
+ create mode 100644 benchmarks/kernels/profile_eagle_aux_rmsnorm.py
+ create mode 100644 tests/kernels/test_eagle_aux_rmsnorm.py
+ create mode 100644 vllm/model_executor/layers/eagle_aux_rmsnorm.py
+
+diff --git a/benchmarks/kernels/benchmark_eagle_aux_rmsnorm.py b/benchmarks/kernels/benchmark_eagle_aux_rmsnorm.py
+new file mode 100644
+index 0000000..96da859
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_eagle_aux_rmsnorm.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import argparse
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++from vllm.triton_utils import triton
++
++
++def baseline(
++    x0: torch.Tensor,
++    x1: torch.Tensor,
++    weight0: torch.Tensor,
++    weight1: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    hidden_states = torch.cat((x0, x1), dim=-1)
++    chunk0, chunk1 = hidden_states.chunk(2, dim=-1)
++    out0 = torch.empty_like(chunk0)
++    out1 = torch.empty_like(chunk1)
++    ops.rms_norm(out0, chunk0, weight0, eps)
++    ops.rms_norm(out1, chunk1, weight1, eps)
++    return torch.cat((out0, out1), dim=-1)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--hidden-size", type=int, default=5120)
++    parser.add_argument(
++        "--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64]
++    )
++    args = parser.parse_args()
++
++    eps = 1e-6
++    print("tokens,baseline_us,fused_us,speedup")
++    for num_tokens in args.tokens:
++        x0 = torch.randn(
++            num_tokens, args.hidden_size, device="cuda", dtype=torch.bfloat16
++        )
++        x1 = torch.randn_like(x0)
++        weight0 = torch.randn(args.hidden_size, device="cuda", dtype=torch.bfloat16)
++        weight1 = torch.randn_like(weight0)
++
++        expected = baseline(x0, x1, weight0, weight1, eps)
++        actual = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++
++        baseline_ms = triton.testing.do_bench(
++            lambda: baseline(x0, x1, weight0, weight1, eps),
++            warmup=100,
++            rep=500,
++        )
++        fused_ms = triton.testing.do_bench(
++            lambda: fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps),
++            warmup=100,
++            rep=500,
++        )
++        print(
++            f"{num_tokens},{baseline_ms * 1000:.3f},{fused_ms * 1000:.3f},"
++            f"{baseline_ms / fused_ms:.3f}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/kernels/profile_eagle_aux_rmsnorm.py b/benchmarks/kernels/profile_eagle_aux_rmsnorm.py
+new file mode 100644
+index 0000000..2549ee3
+--- /dev/null
++++ b/benchmarks/kernels/profile_eagle_aux_rmsnorm.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++from collections.abc import Callable
++from pathlib import Path
++
++import torch
++from torch.profiler import ProfilerActivity, profile, record_function
++
++from benchmark_eagle_aux_rmsnorm import baseline
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++
++
++def profile_kernels(
++    label: str,
++    fn: Callable[[], torch.Tensor],
++    trace_path: Path,
++) -> list[str]:
++    fn()
++    torch.cuda.synchronize()
++    with profile(
++        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
++    ) as prof:
++        with record_function(label):
++            fn()
++        torch.cuda.synchronize()
++    prof.export_chrome_trace(str(trace_path))
++    trace = json.loads(trace_path.read_text())
++    return [
++        event["name"]
++        for event in trace["traceEvents"]
++        if event.get("cat", "").lower() == "kernel"
++    ]
++
++
++def main() -> None:
++    num_tokens = 16
++    hidden_size = 5120
++    eps = 1e-6
++    x0 = torch.randn(
++        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
++    )
++    x1 = torch.randn_like(x0)
++    weight0 = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
++    weight1 = torch.randn_like(weight0)
++
++    baseline_names = profile_kernels(
++        "baseline_aux_prep",
++        lambda: baseline(x0, x1, weight0, weight1, eps),
++        Path("/tmp/eagle_aux_baseline_trace.json"),
++    )
++    fused_names = profile_kernels(
++        "fused_aux_prep",
++        lambda: fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps),
++        Path("/tmp/eagle_aux_fused_trace.json"),
++    )
++    print(json.dumps({"baseline": baseline_names, "fused": fused_names}, indent=2))
++    print(f"kernel_launches,{len(baseline_names)},{len(fused_names)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/test_eagle_aux_rmsnorm.py b/tests/kernels/test_eagle_aux_rmsnorm.py
+new file mode 100644
+index 0000000..0135ed8
+--- /dev/null
++++ b/tests/kernels/test_eagle_aux_rmsnorm.py
+@@ -0,0 +1,132 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
++
++
++class _ReferenceRMSNorm:
++    def __init__(self, weight: torch.Tensor, eps: float) -> None:
++        self.weight = weight
++        self.variance_epsilon = eps
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        out = torch.empty_like(x)
++        ops.rms_norm(out, x, self.weight, self.variance_epsilon)
++        return out
++
++
++@pytest.mark.parametrize("num_tokens", [1, 3, 16, 64])
++@pytest.mark.parametrize("hidden_size", [256, 5120])
++@torch.inference_mode()
++def test_fused_two_aux_rms_norm(num_tokens: int, hidden_size: int) -> None:
++    torch.manual_seed(0)
++    device = "cuda"
++    dtype = torch.bfloat16
++    eps = 1e-6
++    x0 = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
++    x1 = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
++    weight0 = torch.randn(hidden_size, device=device, dtype=dtype)
++    weight1 = torch.randn(hidden_size, device=device, dtype=dtype)
++
++    expected0 = torch.empty_like(x0)
++    expected1 = torch.empty_like(x1)
++    ops.rms_norm(expected0, x0, weight0, eps)
++    ops.rms_norm(expected1, x1, weight1, eps)
++    expected = torch.cat((expected0, expected1), dim=-1)
++
++    actual = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++
++    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++
++
++@torch.inference_mode()
++def test_qwen3_eagle3_combines_two_aux_states_with_fused_norm() -> None:
++    torch.manual_seed(0)
++    num_tokens = 4
++    hidden_size = 5120
++    eps = 1e-6
++    x0 = torch.randn(
++        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
++    )
++    x1 = torch.randn_like(x0)
++    weight0 = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
++    weight1 = torch.randn_like(weight0)
++
++    expected0 = torch.empty_like(x0)
++    expected1 = torch.empty_like(x1)
++    ops.rms_norm(expected0, x0, weight0, eps)
++    ops.rms_norm(expected1, x1, weight1, eps)
++    expected = torch.cat((expected0, expected1), dim=-1)
++
++    model = SimpleNamespace(
++        use_aux_hidden_state=True,
++        norm_before_fc=False,
++        fc_norm=[
++            SimpleNamespace(weight=weight0, variance_epsilon=eps),
++            SimpleNamespace(weight=weight1, variance_epsilon=eps),
++        ],
++        fc=lambda x: x,
++    )
++    eagle = SimpleNamespace(model=model)
++    actual = Eagle3Qwen3ForCausalLM.combine_hidden_states(eagle, [x0, x1])
++
++    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++
++
++@torch.inference_mode()
++def test_fused_two_aux_rms_norm_cuda_graph() -> None:
++    torch.manual_seed(0)
++    num_tokens = 16
++    hidden_size = 5120
++    eps = 1e-6
++    x0 = torch.randn(
++        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
++    )
++    x1 = torch.randn_like(x0)
++    weight0 = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
++    weight1 = torch.randn_like(weight0)
++
++    expected = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        actual = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++
++    x0.normal_()
++    x1.normal_()
++    expected = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++    graph.replay()
++    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++
++
++@torch.inference_mode()
++def test_qwen3_eagle3_falls_back_for_different_aux_epsilons() -> None:
++    torch.manual_seed(0)
++    x0 = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
++    x1 = torch.randn_like(x0)
++    norm0 = _ReferenceRMSNorm(
++        torch.randn(256, device="cuda", dtype=torch.bfloat16), 1e-5
++    )
++    norm1 = _ReferenceRMSNorm(
++        torch.randn(256, device="cuda", dtype=torch.bfloat16), 1e-6
++    )
++    expected = torch.cat((norm0(x0), norm1(x1)), dim=-1)
++
++    model = SimpleNamespace(
++        use_aux_hidden_state=True,
++        norm_before_fc=False,
++        fc_norm=[norm0, norm1],
++        num_aux_layers=2,
++        fc=lambda x: x,
++    )
++    eagle = SimpleNamespace(model=model)
++    actual = Eagle3Qwen3ForCausalLM.combine_hidden_states(eagle, [x0, x1])
++
++    torch.testing.assert_close(actual, expected)
+diff --git a/vllm/model_executor/layers/eagle_aux_rmsnorm.py b/vllm/model_executor/layers/eagle_aux_rmsnorm.py
+new file mode 100644
+index 0000000..e34448f
+--- /dev/null
++++ b/vllm/model_executor/layers/eagle_aux_rmsnorm.py
+@@ -0,0 +1,106 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _fused_two_aux_rms_norm_kernel(
++    x0_ptr,
++    x1_ptr,
++    weight0_ptr,
++    weight1_ptr,
++    output_ptr,
++    stride_x0_row,
++    stride_x1_row,
++    stride_output_row,
++    hidden_size: tl.constexpr,
++    eps: tl.constexpr,
++    block_size: tl.constexpr,
++):
++    row = tl.program_id(0)
++    aux = tl.program_id(1)
++    offsets = tl.arange(0, block_size)
++    mask = offsets < hidden_size
++
++    if aux == 0:
++        values = tl.load(
++            x0_ptr + row * stride_x0_row + offsets,
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        weights = tl.load(weight0_ptr + offsets, mask=mask, other=0.0).to(
++            tl.float32
++        )
++    else:
++        values = tl.load(
++            x1_ptr + row * stride_x1_row + offsets,
++            mask=mask,
++            other=0.0,
++        ).to(tl.float32)
++        weights = tl.load(weight1_ptr + offsets, mask=mask, other=0.0).to(
++            tl.float32
++        )
++
++    variance = tl.sum(values * values, axis=0) / hidden_size
++    normalized = values * tl.rsqrt(variance + eps) * weights
++    output_offsets = row * stride_output_row + aux * hidden_size + offsets
++    tl.store(output_ptr + output_offsets, normalized, mask=mask)
++
++
++def fused_two_aux_rms_norm(
++    x0: torch.Tensor,
++    x1: torch.Tensor,
++    weight0: torch.Tensor,
++    weight1: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    """RMS-normalize two EAGLE aux tensors into one concatenated output."""
++    if x0.ndim != 2 or x1.ndim != 2 or x0.shape != x1.shape:
++        raise ValueError("EAGLE aux tensors must be rank-2 and have equal shapes")
++    if x0.stride(1) != 1 or x1.stride(1) != 1:
++        raise ValueError(
++            "EAGLE aux tensors must be contiguous in the hidden dimension"
++        )
++    if weight0.shape != (x0.shape[1],) or weight1.shape != (x0.shape[1],):
++        raise ValueError("EAGLE aux RMSNorm weights must match the hidden size")
++    if x0.dtype != x1.dtype or x0.device != x1.device:
++        raise ValueError("EAGLE aux tensors must have the same dtype and device")
++    if weight0.device != x0.device or weight1.device != x0.device:
++        raise ValueError("EAGLE aux RMSNorm weights must be on the input device")
++    if weight0.dtype != x0.dtype or weight1.dtype != x0.dtype:
++        raise ValueError("EAGLE aux RMSNorm weights must match the input dtype")
++    if not weight0.is_contiguous() or not weight1.is_contiguous():
++        raise ValueError("EAGLE aux RMSNorm weights must be contiguous")
++
++    num_tokens, hidden_size = x0.shape
++    output = torch.empty(
++        num_tokens,
++        2 * hidden_size,
++        dtype=x0.dtype,
++        device=x0.device,
++    )
++    if num_tokens == 0:
++        return output
++
++    block_size = triton.next_power_of_2(hidden_size)
++    num_warps = 8 if block_size >= 4096 else 4
++    _fused_two_aux_rms_norm_kernel[(num_tokens, 2)](
++        x0,
++        x1,
++        weight0,
++        weight1,
++        output,
++        x0.stride(0),
++        x1.stride(0),
++        output.stride(0),
++        hidden_size=hidden_size,
++        eps=eps,
++        block_size=block_size,
++        num_warps=num_warps,
++    )
++    return output
+diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
+index 5b4e5a7..e1f8457 100644
+--- a/vllm/model_executor/models/qwen3_eagle3.py
++++ b/vllm/model_executor/models/qwen3_eagle3.py
+@@ -368,12 +368,39 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
+ 
+     def combine_hidden_states(
+         self,
+-        hidden_states: torch.Tensor,
++        hidden_states: torch.Tensor | list[torch.Tensor],
+     ) -> torch.Tensor:
+         if not self.model.use_aux_hidden_state:
++            assert isinstance(hidden_states, torch.Tensor)
+             return hidden_states
+         # combine multiple auxiliary hidden states returned by eagle3
+ 
++        if isinstance(hidden_states, list):
++            if (
++                not self.model.norm_before_fc
++                and self.model.fc_norm is not None
++                and len(hidden_states) == 2
++                and hidden_states[0].is_cuda
++                and hidden_states[0].dtype == hidden_states[1].dtype
++                and hidden_states[0].dtype == self.model.fc_norm[0].weight.dtype
++                and hidden_states[0].dtype == self.model.fc_norm[1].weight.dtype
++                and self.model.fc_norm[0].variance_epsilon
++                == self.model.fc_norm[1].variance_epsilon
++            ):
++                from vllm.model_executor.layers.eagle_aux_rmsnorm import (
++                    fused_two_aux_rms_norm,
++                )
++
++                hidden_states = fused_two_aux_rms_norm(
++                    hidden_states[0],
++                    hidden_states[1],
++                    self.model.fc_norm[0].weight,
++                    self.model.fc_norm[1].weight,
++                    self.model.fc_norm[0].variance_epsilon,
++                )
++                return self.model.fc(hidden_states)
++            hidden_states = torch.cat(hidden_states, dim=-1)
++
+         if self.model.norm_before_fc:
+             hidden_states = self.model.input_norm(hidden_states)
+ 
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 0eaba01..7a30164 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -507,6 +507,12 @@ class SpecDecodeBaseProposer:
+     def take_last_draft_probs(self) -> torch.Tensor | None:
+         return self._last_draft_probs
+ 
++    def supports_fused_qwen3_aux_hidden_state_prep(self) -> bool:
++        model = self.model
++        if isinstance(model, BreakableCUDAGraphWrapper):
++            model = model.unwrap()
++        return isinstance(model, Eagle3Qwen3ForCausalLM)
++
+     def propose(
+         self,
+         num_speculative_tokens,
+@@ -515,7 +521,7 @@ class SpecDecodeBaseProposer:
+         # [num_tokens] or [3, num_tokens] when M-RoPE is enabled
+         target_positions: torch.Tensor,
+         # [num_tokens, hidden_size]
+-        target_hidden_states: torch.Tensor,
++        target_hidden_states: torch.Tensor | list[torch.Tensor],
+         # [batch_size]
+         next_token_ids: torch.Tensor,
+         token_indices_to_sample: torch.Tensor | None,
+@@ -545,6 +551,8 @@ class SpecDecodeBaseProposer:
+                     DFlashLagunaForCausalLM,
+                 ),
+             )
++            if isinstance(target_hidden_states, list):
++                assert isinstance(model, Eagle3Qwen3ForCausalLM)
+             target_hidden_states = self.model.combine_hidden_states(
+                 target_hidden_states
+             )
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e6ba7bc..ddd6f62 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5276,6 +5276,12 @@ class GPUModelRunner(
+             if alt is not None:
+                 hidden_states = alt
+ 
++            use_fused_qwen3_aux_prep = (
++                self.use_aux_hidden_state_outputs
++                and isinstance(self.drafter, EagleProposer)
++                and self.drafter.supports_fused_qwen3_aux_hidden_state_prep()
++            )
++
+             num_rejected_tokens_gpu = None
+             if spec_decode_metadata is None:
+                 token_indices_to_sample = None
+@@ -5284,8 +5290,13 @@ class GPUModelRunner(
+                 target_positions = self._get_positions(num_scheduled_tokens)
+                 if self.use_aux_hidden_state_outputs:
+                     assert aux_hidden_states is not None
+-                    target_hidden_states = torch.cat(
+-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
++                    selected_aux_hidden_states = [
++                        h[:num_scheduled_tokens] for h in aux_hidden_states
++                    ]
++                    target_hidden_states = (
++                        selected_aux_hidden_states
++                        if use_fused_qwen3_aux_prep
++                        else torch.cat(selected_aux_hidden_states, dim=-1)
+                     )
+                 else:
+                     target_hidden_states = hidden_states[:num_scheduled_tokens]
+@@ -5301,8 +5312,13 @@ class GPUModelRunner(
+                     target_positions = self._get_positions(token_indices)
+                     if self.use_aux_hidden_state_outputs:
+                         assert aux_hidden_states is not None
+-                        target_hidden_states = torch.cat(
+-                            [h[token_indices] for h in aux_hidden_states], dim=-1
++                        selected_aux_hidden_states = [
++                            h[token_indices] for h in aux_hidden_states
++                        ]
++                        target_hidden_states = (
++                            selected_aux_hidden_states
++                            if use_fused_qwen3_aux_prep
++                            else torch.cat(selected_aux_hidden_states, dim=-1)
+                         )
+                     else:
+                         target_hidden_states = hidden_states[token_indices]
+@@ -5322,8 +5338,13 @@ class GPUModelRunner(
+                     target_positions = self._get_positions(total_num_tokens)
+                     if self.use_aux_hidden_state_outputs:
+                         assert aux_hidden_states is not None
+-                        target_hidden_states = torch.cat(
+-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
++                        selected_aux_hidden_states = [
++                            h[:total_num_tokens] for h in aux_hidden_states
++                        ]
++                        target_hidden_states = (
++                            selected_aux_hidden_states
++                            if use_fused_qwen3_aux_prep
++                            else torch.cat(selected_aux_hidden_states, dim=-1)
+                         )
+                     else:
+                         target_hidden_states = hidden_states[:total_num_tokens]
+-- 
+2.43.0
+
+
+From e35ab11b0958d3406746f6daeedcd7279f7fdba4 Mon Sep 17 00:00:00 2001
+From: zhenchen <zhenchen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:00:49 +0800
+Subject: [PATCH 2/2] Fuse Qwen3 EAGLE first-layer input normalization
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+
+Signed-off-by: zhenchen <zhenchen@users.noreply.github.com>
+---
+ .../kernels/benchmark_eagle_layer0_rmsnorm.py |  76 +++++++++++++
+ .../kernels/profile_eagle_layer0_rmsnorm.py   |  67 ++++++++++++
+ tests/kernels/test_eagle_layer0_rmsnorm.py    | 103 ++++++++++++++++++
+ .../layers/eagle_aux_rmsnorm.py               |  71 ++++++++----
+ vllm/model_executor/models/qwen3_eagle3.py    |  44 +++++++-
+ 5 files changed, 337 insertions(+), 24 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_eagle_layer0_rmsnorm.py
+ create mode 100644 benchmarks/kernels/profile_eagle_layer0_rmsnorm.py
+ create mode 100644 tests/kernels/test_eagle_layer0_rmsnorm.py
+
+diff --git a/benchmarks/kernels/benchmark_eagle_layer0_rmsnorm.py b/benchmarks/kernels/benchmark_eagle_layer0_rmsnorm.py
+new file mode 100644
+index 0000000..6670a55
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_eagle_layer0_rmsnorm.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import argparse
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++from vllm.triton_utils import triton
++
++
++def baseline(
++    embeds: torch.Tensor,
++    hidden_states: torch.Tensor,
++    embed_weight: torch.Tensor,
++    hidden_weight: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    normed_embeds = torch.empty_like(embeds)
++    normed_hidden = torch.empty_like(hidden_states)
++    ops.rms_norm(normed_embeds, embeds, embed_weight, eps)
++    ops.rms_norm(normed_hidden, hidden_states, hidden_weight, eps)
++    return torch.cat((normed_embeds, normed_hidden), dim=-1)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--hidden-size", type=int, default=5120)
++    parser.add_argument(
++        "--tokens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64]
++    )
++    args = parser.parse_args()
++
++    eps = 1e-6
++    print("tokens,baseline_us,fused_us,speedup")
++    for num_tokens in args.tokens:
++        embeds = torch.randn(
++            num_tokens, args.hidden_size, device="cuda", dtype=torch.bfloat16
++        )
++        hidden_states = torch.randn_like(embeds)
++        embed_weight = torch.randn(
++            args.hidden_size, device="cuda", dtype=torch.bfloat16
++        )
++        hidden_weight = torch.randn_like(embed_weight)
++
++        expected = baseline(
++            embeds, hidden_states, embed_weight, hidden_weight, eps
++        )
++        actual = fused_two_aux_rms_norm(
++            embeds, hidden_states, embed_weight, hidden_weight, eps
++        )
++        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++
++        baseline_ms = triton.testing.do_bench(
++            lambda: baseline(
++                embeds, hidden_states, embed_weight, hidden_weight, eps
++            ),
++            warmup=100,
++            rep=500,
++        )
++        fused_ms = triton.testing.do_bench(
++            lambda: fused_two_aux_rms_norm(
++                embeds, hidden_states, embed_weight, hidden_weight, eps
++            ),
++            warmup=100,
++            rep=500,
++        )
++        print(
++            f"{num_tokens},{baseline_ms * 1000:.3f},{fused_ms * 1000:.3f},"
++            f"{baseline_ms / fused_ms:.3f}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/kernels/profile_eagle_layer0_rmsnorm.py b/benchmarks/kernels/profile_eagle_layer0_rmsnorm.py
+new file mode 100644
+index 0000000..1179a15
+--- /dev/null
++++ b/benchmarks/kernels/profile_eagle_layer0_rmsnorm.py
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++from collections.abc import Callable
++from pathlib import Path
++
++import torch
++from torch.profiler import ProfilerActivity, profile, record_function
++
++from benchmark_eagle_layer0_rmsnorm import baseline
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++
++
++def profile_kernels(
++    label: str,
++    fn: Callable[[], torch.Tensor],
++    trace_path: Path,
++) -> list[str]:
++    fn()
++    torch.cuda.synchronize()
++    with profile(
++        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
++    ) as prof:
++        with record_function(label):
++            fn()
++        torch.cuda.synchronize()
++    prof.export_chrome_trace(str(trace_path))
++    trace = json.loads(trace_path.read_text())
++    return [
++        event["name"]
++        for event in trace["traceEvents"]
++        if event.get("cat", "").lower() == "kernel"
++    ]
++
++
++def main() -> None:
++    num_tokens = 16
++    hidden_size = 5120
++    eps = 1e-6
++    embeds = torch.randn(
++        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
++    )
++    hidden_states = torch.randn_like(embeds)
++    embed_weight = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
++    hidden_weight = torch.randn_like(embed_weight)
++
++    baseline_names = profile_kernels(
++        "baseline_eagle_layer0_prep",
++        lambda: baseline(
++            embeds, hidden_states, embed_weight, hidden_weight, eps
++        ),
++        Path("/tmp/eagle_layer0_baseline_trace.json"),
++    )
++    fused_names = profile_kernels(
++        "fused_eagle_layer0_prep",
++        lambda: fused_two_aux_rms_norm(
++            embeds, hidden_states, embed_weight, hidden_weight, eps
++        ),
++        Path("/tmp/eagle_layer0_fused_trace.json"),
++    )
++    print(json.dumps({"baseline": baseline_names, "fused": fused_names}, indent=2))
++    print(f"kernel_launches,{len(baseline_names)},{len(fused_names)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/test_eagle_layer0_rmsnorm.py b/tests/kernels/test_eagle_layer0_rmsnorm.py
+new file mode 100644
+index 0000000..1f38044
+--- /dev/null
++++ b/tests/kernels/test_eagle_layer0_rmsnorm.py
+@@ -0,0 +1,103 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import torch
++
++from vllm import _custom_ops as ops
++from vllm.model_executor.layers.eagle_aux_rmsnorm import fused_two_aux_rms_norm
++from vllm.model_executor.models.qwen3_eagle3 import Qwen3Eagle3DecoderLayer
++
++
++class _ReferenceRMSNorm:
++    def __init__(self, weight: torch.Tensor, eps: float) -> None:
++        self.weight = weight
++        self.variance_epsilon = eps
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        out = torch.empty_like(x)
++        ops.rms_norm(out, x, self.weight, self.variance_epsilon)
++        return out
++
++
++@torch.inference_mode()
++def test_qwen3_eagle_layer0_fused_input_prep() -> None:
++    torch.manual_seed(0)
++    num_tokens = 16
++    hidden_size = 5120
++    eps = 1e-6
++    embeds = torch.randn(
++        num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
++    )
++    hidden_states = torch.randn_like(embeds)
++    input_norm = _ReferenceRMSNorm(
++        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16), eps
++    )
++    hidden_norm = _ReferenceRMSNorm(
++        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16), eps
++    )
++    expected = torch.cat((input_norm(embeds), hidden_norm(hidden_states)), dim=-1)
++
++    layer = SimpleNamespace(
++        norm_before_residual=False,
++        input_layernorm=input_norm,
++        hidden_norm=hidden_norm,
++    )
++    actual, residual = Qwen3Eagle3DecoderLayer._prepare_first_layer_inputs(
++        layer, embeds, hidden_states
++    )
++
++    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
++    assert residual is hidden_states
++
++
++@torch.inference_mode()
++def test_qwen3_eagle_layer0_falls_back_for_norm_before_residual() -> None:
++    torch.manual_seed(0)
++    embeds = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
++    hidden_states = torch.randn_like(embeds)
++    eps = 1e-6
++    input_norm = _ReferenceRMSNorm(
++        torch.randn(256, device="cuda", dtype=torch.bfloat16), eps
++    )
++    hidden_norm = _ReferenceRMSNorm(
++        torch.randn(256, device="cuda", dtype=torch.bfloat16), eps
++    )
++
++    def norm_before(
++        hidden_states: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        normalized = hidden_norm(hidden_states)
++        return normalized, normalized
++
++    layer = SimpleNamespace(
++        norm_before_residual=True,
++        input_layernorm=input_norm,
++        hidden_norm=hidden_norm,
++        _residual_norm=norm_before,
++    )
++    actual, residual = Qwen3Eagle3DecoderLayer._prepare_first_layer_inputs(
++        layer, embeds, hidden_states
++    )
++    expected_hidden = hidden_norm(hidden_states)
++    expected = torch.cat((input_norm(embeds), expected_hidden), dim=-1)
++
++    torch.testing.assert_close(actual, expected)
++    torch.testing.assert_close(residual, expected_hidden)
++
++
++@torch.inference_mode()
++def test_fused_two_aux_rms_norm_torch_compile() -> None:
++    torch.manual_seed(0)
++    x0 = torch.randn(16, 5120, device="cuda", dtype=torch.bfloat16)
++    x1 = torch.randn_like(x0)
++    weight0 = torch.randn(5120, device="cuda", dtype=torch.bfloat16)
++    weight1 = torch.randn_like(weight0)
++    eps = 1e-6
++    expected = fused_two_aux_rms_norm(x0, x1, weight0, weight1, eps)
++
++    compiled = torch.compile(fused_two_aux_rms_norm, fullgraph=True)
++    actual = compiled(x0, x1, weight0, weight1, eps)
++
++    torch.testing.assert_close(actual, expected)
+diff --git a/vllm/model_executor/layers/eagle_aux_rmsnorm.py b/vllm/model_executor/layers/eagle_aux_rmsnorm.py
+index e34448f..a81b6d9 100644
+--- a/vllm/model_executor/layers/eagle_aux_rmsnorm.py
++++ b/vllm/model_executor/layers/eagle_aux_rmsnorm.py
+@@ -5,7 +5,9 @@ from __future__ import annotations
+ 
+ import torch
+ 
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ 
+ @triton.jit
+@@ -52,31 +54,13 @@ def _fused_two_aux_rms_norm_kernel(
+     tl.store(output_ptr + output_offsets, normalized, mask=mask)
+ 
+ 
+-def fused_two_aux_rms_norm(
++def _fused_two_aux_rms_norm_impl(
+     x0: torch.Tensor,
+     x1: torch.Tensor,
+     weight0: torch.Tensor,
+     weight1: torch.Tensor,
+     eps: float,
+ ) -> torch.Tensor:
+-    """RMS-normalize two EAGLE aux tensors into one concatenated output."""
+-    if x0.ndim != 2 or x1.ndim != 2 or x0.shape != x1.shape:
+-        raise ValueError("EAGLE aux tensors must be rank-2 and have equal shapes")
+-    if x0.stride(1) != 1 or x1.stride(1) != 1:
+-        raise ValueError(
+-            "EAGLE aux tensors must be contiguous in the hidden dimension"
+-        )
+-    if weight0.shape != (x0.shape[1],) or weight1.shape != (x0.shape[1],):
+-        raise ValueError("EAGLE aux RMSNorm weights must match the hidden size")
+-    if x0.dtype != x1.dtype or x0.device != x1.device:
+-        raise ValueError("EAGLE aux tensors must have the same dtype and device")
+-    if weight0.device != x0.device or weight1.device != x0.device:
+-        raise ValueError("EAGLE aux RMSNorm weights must be on the input device")
+-    if weight0.dtype != x0.dtype or weight1.dtype != x0.dtype:
+-        raise ValueError("EAGLE aux RMSNorm weights must match the input dtype")
+-    if not weight0.is_contiguous() or not weight1.is_contiguous():
+-        raise ValueError("EAGLE aux RMSNorm weights must be contiguous")
+-
+     num_tokens, hidden_size = x0.shape
+     output = torch.empty(
+         num_tokens,
+@@ -104,3 +88,52 @@ def fused_two_aux_rms_norm(
+         num_warps=num_warps,
+     )
+     return output
++
++
++def _fused_two_aux_rms_norm_fake(
++    x0: torch.Tensor,
++    x1: torch.Tensor,
++    weight0: torch.Tensor,
++    weight1: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    del x1, weight0, weight1, eps
++    return x0.new_empty(x0.shape[0], 2 * x0.shape[1])
++
++
++direct_register_custom_op(
++    op_name="fused_two_aux_rms_norm",
++    op_func=_fused_two_aux_rms_norm_impl,
++    mutates_args=[],
++    fake_impl=_fused_two_aux_rms_norm_fake,
++    dispatch_key=current_platform.dispatch_key,
++)
++
++
++def fused_two_aux_rms_norm(
++    x0: torch.Tensor,
++    x1: torch.Tensor,
++    weight0: torch.Tensor,
++    weight1: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    """RMS-normalize two EAGLE aux tensors into one concatenated output."""
++    if x0.ndim != 2 or x1.ndim != 2 or x0.shape != x1.shape:
++        raise ValueError("EAGLE aux tensors must be rank-2 and have equal shapes")
++    if x0.stride(1) != 1 or x1.stride(1) != 1:
++        raise ValueError(
++            "EAGLE aux tensors must be contiguous in the hidden dimension"
++        )
++    if weight0.shape != (x0.shape[1],) or weight1.shape != (x0.shape[1],):
++        raise ValueError("EAGLE aux RMSNorm weights must match the hidden size")
++    if x0.dtype != x1.dtype or x0.device != x1.device:
++        raise ValueError("EAGLE aux tensors must have the same dtype and device")
++    if weight0.device != x0.device or weight1.device != x0.device:
++        raise ValueError("EAGLE aux RMSNorm weights must be on the input device")
++    if weight0.dtype != x0.dtype or weight1.dtype != x0.dtype:
++        raise ValueError("EAGLE aux RMSNorm weights must match the input dtype")
++    if not weight0.is_contiguous() or not weight1.is_contiguous():
++        raise ValueError("EAGLE aux RMSNorm weights must be contiguous")
++    return torch.ops.vllm.fused_two_aux_rms_norm(
++        x0, x1, weight0, weight1, eps
++    )
+diff --git a/vllm/model_executor/models/qwen3_eagle3.py b/vllm/model_executor/models/qwen3_eagle3.py
+index e1f8457..ca42ffe 100644
+--- a/vllm/model_executor/models/qwen3_eagle3.py
++++ b/vllm/model_executor/models/qwen3_eagle3.py
+@@ -82,11 +82,46 @@ class Qwen3Eagle3DecoderLayer(Qwen3DecoderLayer):
+         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.layer_idx = layer_idx
+ 
+-        if getattr(config, "norm_before_residual", False):
++        self.norm_before_residual = bool(
++            getattr(config, "norm_before_residual", False)
++        )
++        if self.norm_before_residual:
+             self._residual_norm = self._norm_before_residual
+         else:
+             self._residual_norm = self._norm_after_residual
+ 
++    def _prepare_first_layer_inputs(
++        self,
++        embeds: torch.Tensor,
++        hidden_states: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        if (
++            not self.norm_before_residual
++            and embeds.is_cuda
++            and embeds.shape == hidden_states.shape
++            and embeds.dtype == hidden_states.dtype
++            and embeds.dtype == self.input_layernorm.weight.dtype
++            and embeds.dtype == self.hidden_norm.weight.dtype
++            and self.input_layernorm.variance_epsilon
++            == self.hidden_norm.variance_epsilon
++        ):
++            from vllm.model_executor.layers.eagle_aux_rmsnorm import (
++                fused_two_aux_rms_norm,
++            )
++
++            combined = fused_two_aux_rms_norm(
++                embeds,
++                hidden_states,
++                self.input_layernorm.weight,
++                self.hidden_norm.weight,
++                self.input_layernorm.variance_epsilon,
++            )
++            return combined, hidden_states
++
++        embeds = self.input_layernorm(embeds)
++        hidden_states, residual = self._residual_norm(hidden_states=hidden_states)
++        return torch.cat([embeds, hidden_states], dim=-1), residual
++
+     def _norm_before_residual(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+@@ -109,10 +144,9 @@ class Qwen3Eagle3DecoderLayer(Qwen3DecoderLayer):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         if self.layer_idx == 0:
+-            # First layer: concatenate embeds with hidden_states
+-            embeds = self.input_layernorm(embeds)
+-            hidden_states, residual = self._residual_norm(hidden_states=hidden_states)
+-            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
++            hidden_states, residual = self._prepare_first_layer_inputs(
++                embeds, hidden_states
++            )
+         else:
+             # Subsequent layers: process hidden_states and residuals only
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+-- 
+2.43.0
+

@@ -1,5 +1,13 @@
 # Radeon LLM Optimization
 
+## Current branch: combined EAGLE preparation fusions
+
+Status: **micro-validated / E2E rejected**. This branch carries a stock-based
+series stacking the auxiliary-state and first-layer preparation fusions under
+[`experiments/eagle-fusions-combined`](experiments/eagle-fusions-combined/README.md).
+The component microbenchmarks are positive, but the repeated same-pair service
+gate is neutral and does not justify promotion.
+
 Reproducible performance engineering for vLLM speculative decoding on AMD Radeon GPUs.
 
 The first tracked workload is Qwen3.8-27B with `amd/Qwen3.8-27B-EAGLE3-Full-Vocab` on 2× Radeon Pro W7900D (`gfx1100`, ROCm 7.2, vLLM 0.29.0). The repository keeps raw-result indexes, launch/benchmark scripts, optimization hypotheses, validated deltas, and PR-ready branches separate.
