@@ -1,0 +1,617 @@
+diff --git a/csrc/rocm/ops.h b/csrc/rocm/ops.h
+index d4b2cd4..6fbd315 100644
+--- a/csrc/rocm/ops.h
++++ b/csrc/rocm/ops.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <torch/all.h>
++#include <tuple>
+ 
+ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
+                     const int64_t rows_per_block);
+@@ -9,6 +10,11 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
+                        const std::optional<at::Tensor>& in_bias,
+                        const int64_t CuCount);
+ 
++std::tuple<torch::Tensor, torch::Tensor> wvSplitKRMSNorm(
++    const at::Tensor& weight, const at::Tensor& hidden,
++    const at::Tensor& residual, const at::Tensor& norm_weight,
++    const double epsilon, const int64_t CuCount);
++
+ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
+                               const at::Tensor& in_scale,
+                               const std::optional<at::Tensor>& in_zero_points,
+diff --git a/csrc/rocm/skinny_gemms.cu b/csrc/rocm/skinny_gemms.cu
+index 615cdab..221b4e4 100644
+--- a/csrc/rocm/skinny_gemms.cu
++++ b/csrc/rocm/skinny_gemms.cu
+@@ -8,6 +8,7 @@
+ 
+ #include <stdexcept>
+ #include <algorithm>
++#include <tuple>
+ 
+ #include "../cuda_compat.h"
+ #include "dispatch_utils.h"
+@@ -345,13 +346,38 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
+ }
+ 
+ #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
+-// This version targets cases where A[] fits LDS capacity
++template <typename scalar_t, int N, int WvPrGrp, bool FuseRMSNorm>
++struct WvSplitKSharedStorage;
++
++template <typename scalar_t, int N, int WvPrGrp>
++struct WvSplitKSharedStorage<scalar_t, N, WvPrGrp, false> {
++  scalar_t s[LDS_SIZE / sizeof(scalar_t)];
++};
++
++template <typename scalar_t, int N, int WvPrGrp>
++struct WvSplitKSharedStorage<scalar_t, N, WvPrGrp, true> {
++  static constexpr int kNormFloats = N * WvPrGrp + N;
++  static constexpr int kActivationElements =
++      (LDS_SIZE - kNormFloats * sizeof(float)) / sizeof(scalar_t);
++  scalar_t s[kActivationElements];
++  float norm_partial[N][WvPrGrp];
++  float norm_scale[N];
++};
++
++// This version targets cases where A[] fits LDS capacity. FuseRMSNorm reuses
++// the production persistent GEMM and normalizes its LDS activation tile before
++// the dot-product loop. It is intentionally unavailable to the streaming
++// variants below, which serve larger token batches.
+ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+-          int UNRL, int N>
++          int UNRL, int N, bool FuseRMSNorm = false>
+ __global__ void __launch_bounds__(WvPrGrp* THRDS)
+     wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap, const int M,
+                      const int Bx, const int By, const scalar_t* B,
+                      const scalar_t* __restrict__ A,
++                     const scalar_t* __restrict__ RESIDUAL,
++                     const scalar_t* __restrict__ NORM_WEIGHT,
++                     const float NORM_EPS,
++                     scalar_t* __restrict__ RESIDUAL_OUT,
+                      const scalar_t* __restrict__ BIAS, scalar_t* C,
+                      const int _WvPrGrp, const int CuCount) {
+   constexpr int max_lds_len = LDS_SIZE / 2;
+@@ -380,7 +406,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
+   // TODO: When activation matrix is larger than 64 KB
+   //	     then this is not going to work!
+   //----------------------------------------------------
+-  __shared__ scalar_t s[max_lds_len];
++  __shared__ WvSplitKSharedStorage<scalar_t, N, WvPrGrp, FuseRMSNorm>
++      storage;
++  auto& s = storage.s;
+ 
+   //----------------------------------------------------
+   // Fetch the activation matrix to LDS
+@@ -391,16 +419,77 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
+   // - Then the WG will move to another 8 K elements
+   // TODO: Logic below will only work when K is multiple of 8
+   //----------------------------------------------------
++  float norm_sum[N] = {};
+   for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
+        k < min__(Kap * N, max_lds_len); k += THRDS * WvPrGrp * A_CHUNK) {
+   #if defined(__gfx950__)
+-    __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
++    if constexpr (!FuseRMSNorm) {
++      __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0,
++                                      0);
++    }
+   #else
+-    *((bigType*)(&s[k])) = *((bigType*)(&A[k]));
++    if constexpr (!FuseRMSNorm) {
++      *((bigType*)(&s[k])) = *((bigType*)(&A[k]));
++    }
+   #endif
++    if constexpr (FuseRMSNorm) {
++      const int n = k / Kap;
++      bigType values = *((const bigType*)(&A[k]));
++  #pragma unroll
++      for (int j = 0; j < A_CHUNK; ++j) {
++        const float added = static_cast<float>(values.h[j]) +
++                            static_cast<float>(RESIDUAL[k + j]);
++        const scalar_t z = __float2s<scalar_t>(added);
++        values.h[j] = z;
++        RESIDUAL_OUT[k + j] = z;
++        const float zf = static_cast<float>(z);
++        norm_sum[n] += zf * zf;
++      }
++      *((bigType*)(&s[k])) = values;
++    }
+   }
+   __syncthreads();
+ 
++  if constexpr (FuseRMSNorm) {
++  #pragma unroll
++    for (int n = 0; n < N; ++n) {
++      for (int mask = THRDS / 2; mask >= 1; mask /= 2) {
++        norm_sum[n] += __shfl_xor(norm_sum[n], mask);
++      }
++      if (threadIdx.x == 0) {
++        storage.norm_partial[n][threadIdx.y] = norm_sum[n];
++      }
++    }
++    __syncthreads();
++
++    if (threadIdx.y == 0 && threadIdx.x < N) {
++      const int n = threadIdx.x;
++      float total = 0.0f;
++  #pragma unroll
++      for (int wave = 0; wave < WvPrGrp; ++wave) {
++        total += storage.norm_partial[n][wave];
++      }
++      storage.norm_scale[n] = rsqrtf(total / K + NORM_EPS);
++    }
++    __syncthreads();
++
++    for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
++         k < Kap * N; k += THRDS * WvPrGrp * A_CHUNK) {
++      const int n = k / Kap;
++      const int row_k = k - n * Kap;
++      bigType values = *((const bigType*)(&s[k]));
++  #pragma unroll
++      for (int j = 0; j < A_CHUNK; ++j) {
++        const float normalized = static_cast<float>(values.h[j]) *
++                                 storage.norm_scale[n] *
++                                 static_cast<float>(NORM_WEIGHT[row_k + j]);
++        values.h[j] = __float2s<scalar_t>(normalized);
++      }
++      *((bigType*)(&s[k])) = values;
++    }
++    __syncthreads();
++  }
++
+   if (threadIdx.y >= _WvPrGrp) return;
+ 
+   uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
+@@ -569,11 +658,15 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
+ }
+ #else
+ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+-          int UNRL, int N>
++          int UNRL, int N, bool FuseRMSNorm = false>
+ __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
+                                  const int M, const int Bx, const int By,
+                                  const scalar_t* B,
+                                  const scalar_t* __restrict__ A,
++                                 const scalar_t* __restrict__ RESIDUAL,
++                                 const scalar_t* __restrict__ NORM_WEIGHT,
++                                 const float NORM_EPS,
++                                 scalar_t* __restrict__ RESIDUAL_OUT,
+                                  const scalar_t* __restrict__ BIAS, scalar_t* C,
+                                  const int _WvPrGrp, const int CuCount) {
+   UNREACHABLE_CODE
+@@ -1217,7 +1310,8 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
+     if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
+       wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>        \
+           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+-                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
++                                       By_in, af4, bf4, nullptr, nullptr,      \
++                                       0.0f, nullptr, biasf4, c, __wvPrGrp,   \
+                                        CuCount);                              \
+     else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
+       wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>            \
+@@ -1324,6 +1418,120 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
+   return out_c;
+ }
+ 
++std::tuple<torch::Tensor, torch::Tensor> wvSplitKRMSNorm(
++    const at::Tensor& weight, const at::Tensor& hidden,
++    const at::Tensor& residual, const at::Tensor& norm_weight,
++    const double epsilon, const int64_t CuCount) {
++  TORCH_CHECK(on_gfx1x(),
++              "wvSplitKRMSNorm is restricted to RDNA gfx11/gfx12");
++  TORCH_CHECK(weight.dim() == 2 && hidden.dim() == 2 && residual.dim() == 2,
++              "weight, hidden, and residual must be 2-D");
++  TORCH_CHECK(norm_weight.dim() == 1, "norm_weight must be 1-D");
++  TORCH_CHECK(weight.is_contiguous() && hidden.is_contiguous() &&
++                  residual.is_contiguous() && norm_weight.is_contiguous(),
++              "all operands must be contiguous");
++  TORCH_CHECK(weight.dtype() == hidden.dtype() &&
++                  hidden.dtype() == residual.dtype() &&
++                  residual.dtype() == norm_weight.dtype(),
++              "all operands must have the same dtype");
++  TORCH_CHECK(hidden.dtype() == torch::kFloat16 ||
++                  hidden.dtype() == torch::kBFloat16,
++              "only fp16 and bf16 are supported");
++  TORCH_CHECK(hidden.sizes() == residual.sizes(),
++              "hidden and residual shapes must match");
++  TORCH_CHECK(weight.size(1) == hidden.size(1) &&
++                  norm_weight.size(0) == hidden.size(1),
++              "K dimensions must match");
++  TORCH_CHECK(hidden.size(0) >= 1 && hidden.size(0) <= 5,
++              "token count must be in [1, 5]");
++  TORCH_CHECK(hidden.size(1) % 8 == 0, "K must be divisible by 8");
++  TORCH_CHECK(weight.size(0) > 8, "output width must be greater than 8");
++  TORCH_CHECK(epsilon > 0.0, "epsilon must be positive");
++  TORCH_CHECK(CuCount > 0, "CuCount must be positive");
++
++  const auto M_in = weight.size(0);
++  const auto K_in = weight.size(1);
++  const auto N_in = hidden.size(0);
++  const auto Kap_in = weight.stride(0);
++  const auto Kbp_in = hidden.stride(0);
++  const int64_t norm_state_bytes =
++      (N_in * 16 + N_in) * static_cast<int64_t>(sizeof(float));
++  const int64_t activation_bytes =
++      Kbp_in * N_in * static_cast<int64_t>(hidden.element_size());
++  TORCH_CHECK(activation_bytes + norm_state_bytes <= get_lds_size(),
++              "activation and RMSNorm reduction state must fit LDS");
++
++  auto out = torch::empty({N_in, M_in}, hidden.options());
++  auto residual_out = torch::empty_like(residual);
++  dim3 grid(CuCount);
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden));
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++#define WVSPLITK_RMS_CFG(_YTILE, _UNRL, _N)                                \
++  {                                                                        \
++    dim3 block(32, 16);                                                    \
++    int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                   \
++    wvSplitK_hf_sml_<fptype, 32, _YTILE, 16, 8, _UNRL, _N, true>          \
++        <<<grid, block, 0, stream>>>(                                      \
++            K_in, Kap_in, Kbp_in, M_in, 1, 1, weight_ptr, hidden_ptr,      \
++            residual_ptr, norm_weight_ptr, static_cast<float>(epsilon),    \
++            residual_out_ptr, nullptr, out_ptr, __wvPrGrp, CuCount);       \
++  }
++
++#define WVSPLITK_RMS_TILE(_sYT, _N)            \
++  {                                             \
++    if (_sYT <= 1)                              \
++      WVSPLITK_RMS_CFG(1, 4, _N)                \
++    else if ((_N == 1) || (_sYT <= 4 * 2))      \
++      WVSPLITK_RMS_CFG(2, 2, _N)                \
++    else if (_sYT <= 4 * 3)                     \
++      WVSPLITK_RMS_CFG(3, 2, _N)                \
++    else if (_N == 4)                           \
++      WVSPLITK_RMS_CFG(4, 1, _N)                \
++    else                                        \
++      WVSPLITK_RMS_CFG(4, 2, _N)                \
++  }
++
++  AT_DISPATCH_REDUCED_FLOATING_TYPES(hidden.scalar_type(),
++                                     "wvSplitKRMSNorm", [&] {
++    using fptype = typename scalar<scalar_t>::type;
++    const fptype* weight_ptr =
++        reinterpret_cast<const fptype*>(weight.data_ptr());
++    const fptype* hidden_ptr =
++        reinterpret_cast<const fptype*>(hidden.data_ptr());
++    const fptype* residual_ptr =
++        reinterpret_cast<const fptype*>(residual.data_ptr());
++    const fptype* norm_weight_ptr =
++        reinterpret_cast<const fptype*>(norm_weight.data_ptr());
++    fptype* residual_out_ptr =
++        reinterpret_cast<fptype*>(residual_out.data_ptr());
++    fptype* out_ptr = reinterpret_cast<fptype*>(out.data_ptr());
++    const int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);
++
++    switch (N_in) {
++      case 1:
++        WVSPLITK_RMS_TILE(sYT, 1)
++        break;
++      case 2:
++        WVSPLITK_RMS_TILE(sYT, 2)
++        break;
++      case 3:
++        WVSPLITK_RMS_TILE(sYT, 3)
++        break;
++      case 4:
++        WVSPLITK_RMS_TILE(sYT, 4)
++        break;
++      case 5:
++        WVSPLITK_RMS_TILE(sYT, 5)
++        break;
++    }
++  });
++
++#undef WVSPLITK_RMS_TILE
++#undef WVSPLITK_RMS_CFG
++  return {out, residual_out};
++}
++
+ // This version targets cases skinny where CUs are not filled
+ // Wave-SplitK is used with reduction done via atomics.
+ #if defined(__gfx950__)
+diff --git a/csrc/rocm/torch_bindings.cpp b/csrc/rocm/torch_bindings.cpp
+index 92dbed7..6131ab1 100644
+--- a/csrc/rocm/torch_bindings.cpp
++++ b/csrc/rocm/torch_bindings.cpp
+@@ -30,6 +30,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
+       "Tensor");
+   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
+ 
++  // Fused residual-add RMSNorm + skinny GEMM for RDNA decode-sized batches.
++  // It returns both the projection and the rounded residual stream.
++  rocm_ops.def(
++      "wvSplitKRMSNorm(Tensor weight, Tensor hidden, Tensor residual, "
++      "Tensor norm_weight, float epsilon, int CuCount) -> (Tensor, Tensor)");
++  rocm_ops.impl("wvSplitKRMSNorm", torch::kCUDA, &wvSplitKRMSNorm);
++
+   // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales,
+   // optional zero points for asymmetric quantization
+   rocm_ops.def(
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 78a4c43..bc626d7 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2253,6 +2253,20 @@ def wvSplitK(
+     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
+ 
+ 
++def wvSplitKRMSNorm(
++    weight: torch.Tensor,
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    epsilon: float,
++    cu_count: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """RDNA decode-only fused residual-add RMSNorm + skinny GEMM."""
++    return torch.ops._rocm_C.wvSplitKRMSNorm(
++        weight, hidden, residual, norm_weight, epsilon, cu_count
++    )
++
++
+ def wvSplitK_int4_g(
+     weight: torch.Tensor,
+     activation: torch.Tensor,
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 786864b..51c6d3f 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -149,6 +149,7 @@ if TYPE_CHECKING:
+     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
++    VLLM_ROCM_USE_FUSED_RMSNORM_QKV: bool = False
+     VLLM_ROCM_FP8_PADDING: bool = True
+     VLLM_ROCM_MOE_PADDING: bool = True
+     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+@@ -1336,6 +1337,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
+         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+     ),
++    # Experimental RDNA decode path: fuse residual-add RMSNorm into the
++    # production skinny QKV GEMM. Default off until service A/B validation.
++    "VLLM_ROCM_USE_FUSED_RMSNORM_QKV": lambda: (
++        os.getenv("VLLM_ROCM_USE_FUSED_RMSNORM_QKV", "False").lower()
++        in ("true", "1")
++    ),
+     # Pad the fp8 weights to 256 bytes for ROCm
+     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
+     # Pad the weights for the moe kernel
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index caa52f2..782701b 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -368,6 +368,108 @@ direct_register_custom_op(
+ )
+ 
+ 
++def is_rocm_fused_rmsnorm_qkv_shape_supported(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    qkv_weight: torch.Tensor,
++    bias: torch.Tensor | None,
++) -> bool:
++    if bias is not None or hidden.dtype not in (torch.float16, torch.bfloat16):
++        return False
++    if not (
++        hidden.dtype == residual.dtype == norm_weight.dtype == qkv_weight.dtype
++    ):
++        return False
++    if hidden.ndim != 2 or residual.shape != hidden.shape:
++        return False
++    if norm_weight.ndim != 1 or qkv_weight.ndim != 2:
++        return False
++    num_tokens, hidden_size = hidden.shape
++    if not (1 <= num_tokens <= 5) or hidden_size % 8 != 0:
++        return False
++    if norm_weight.shape[0] != hidden_size or qkv_weight.shape[1] != hidden_size:
++        return False
++    if qkv_weight.shape[0] <= 8:
++        return False
++    operands = (hidden, residual, norm_weight, qkv_weight)
++    return all(x.is_contiguous() and x.device == hidden.device for x in operands)
++
++
++def can_use_rocm_fused_rmsnorm_qkv(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    qkv_weight: torch.Tensor,
++    bias: torch.Tensor | None,
++) -> bool:
++    """Return whether the experimental RDNA skinny fusion is safe.
++
++    Every rejected shape uses the existing RMSNorm and linear paths. The
++    kernel deliberately does not replace hipBLASLt for larger token batches.
++    """
++    if not envs.VLLM_ROCM_USE_FUSED_RMSNORM_QKV or not current_platform.is_rocm():
++        return False
++    from vllm.platforms.rocm import on_gfx1x
++
++    return (
++        on_gfx1x()
++        and envs.VLLM_ROCM_USE_SKINNY_GEMM
++        and is_rocm_fused_rmsnorm_qkv_shape_supported(
++            hidden, residual, norm_weight, qkv_weight, bias
++        )
++    )
++
++
++def rocm_fused_rmsnorm_qkv_impl(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    qkv_weight: torch.Tensor,
++    epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return ops.wvSplitKRMSNorm(
++        qkv_weight,
++        hidden,
++        residual,
++        norm_weight,
++        epsilon,
++        num_compute_units(),
++    )
++
++
++def rocm_fused_rmsnorm_qkv_fake(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    qkv_weight: torch.Tensor,
++    epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    del residual, norm_weight, epsilon
++    qkv = hidden.new_empty((*hidden.shape[:-1], qkv_weight.shape[0]))
++    residual_out = hidden.new_empty(hidden.shape)
++    return qkv, residual_out
++
++
++def rocm_fused_rmsnorm_qkv(
++    hidden: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    qkv_weight: torch.Tensor,
++    epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return torch.ops.vllm.rocm_fused_rmsnorm_qkv(
++        hidden, residual, norm_weight, qkv_weight, epsilon
++    )
++
++
++direct_register_custom_op(
++    op_name="rocm_fused_rmsnorm_qkv",
++    op_func=rocm_fused_rmsnorm_qkv_impl,
++    fake_impl=rocm_fused_rmsnorm_qkv_fake,
++)
++
++
+ @functools.cache
+ def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
+     """Eagerly allocate wvSplitKrc's process-lifetime static workspaces.
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 2b16a2e..0af2cdb 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -32,6 +32,10 @@ from vllm.model_executor.layers.linear import (
+     ReplicatedLinear,
+     RowParallelLinear,
+ )
++from vllm.model_executor.layers.utils import (
++    can_use_rocm_fused_rmsnorm_qkv,
++    rocm_fused_rmsnorm_qkv,
++)
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+     QwenGatedDeltaNetAttention,
+@@ -449,6 +453,13 @@ class Qwen3NextAttention(nn.Module):
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
++        return self._forward_projected_qkv(positions, qkv)
++
++    def _forward_projected_qkv(
++        self,
++        positions: torch.Tensor,
++        qkv: torch.Tensor,
++    ) -> torch.Tensor:
+         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+         attn_output = self.attn(q, k, v)
+         if gate is not None:
+@@ -456,6 +467,23 @@ class Qwen3NextAttention(nn.Module):
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
++    def forward_fused_input_rmsnorm(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor,
++        norm_weight: torch.Tensor,
++        norm_epsilon: float,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        qkv, residual_out = rocm_fused_rmsnorm_qkv(
++            hidden_states,
++            residual,
++            norm_weight,
++            self.qkv_proj.weight,
++            norm_epsilon,
++        )
++        return self._forward_projected_qkv(positions, qkv), residual_out
++
+ 
+ class Qwen3NextDecoderLayer(nn.Module):
+     def __init__(
+@@ -552,25 +580,49 @@ class Qwen3NextDecoderLayer(nn.Module):
+     ):
+         full_num_tokens = positions.shape[-1]
+ 
+-        if residual is None:
+-            residual = hidden_states
+-            hidden_states = self.input_layernorm(hidden_states)
+-        else:
+-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        fused_full_attention = False
++        if (
++            residual is not None
++            and self.layer_type == "full_attention"
++            and not self.use_attn_reduce_scatter_for_moe
++            and self.self_attn.qkv_proj.quant_config is None
++            and can_use_rocm_fused_rmsnorm_qkv(
++                hidden_states,
++                residual,
++                self.input_layernorm.weight,
++                self.self_attn.qkv_proj.weight,
++                self.self_attn.qkv_proj.bias,
++            )
++        ):
++            hidden_states, residual = self.self_attn.forward_fused_input_rmsnorm(
++                positions,
++                hidden_states,
++                residual,
++                self.input_layernorm.weight,
++                self.input_layernorm.variance_epsilon,
++            )
++            fused_full_attention = True
+ 
+-        if self.use_attn_reduce_scatter_for_moe:
+-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+-            hidden_states = hidden_states[:full_num_tokens]
++        if not fused_full_attention:
++            if residual is None:
++                residual = hidden_states
++                hidden_states = self.input_layernorm(hidden_states)
++            else:
++                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+ 
+-        if self.layer_type == "linear_attention":
+-            hidden_states = self.linear_attn(hidden_states=hidden_states)
+-        elif self.layer_type == "full_attention":
+-            hidden_states = self.self_attn(
+-                hidden_states=hidden_states,
+-                positions=positions,
+-            )
+-        else:
+-            raise ValueError("Invalid layer_type")
++            if self.use_attn_reduce_scatter_for_moe:
++                hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
++                hidden_states = hidden_states[:full_num_tokens]
++
++            if self.layer_type == "linear_attention":
++                hidden_states = self.linear_attn(hidden_states=hidden_states)
++            elif self.layer_type == "full_attention":
++                hidden_states = self.self_attn(
++                    hidden_states=hidden_states,
++                    positions=positions,
++                )
++            else:
++                raise ValueError("Invalid layer_type")
+ 
+         if self.layer_scale:
+             if len(hidden_states.shape) == 2:

@@ -9,6 +9,7 @@ Updated: 2026-10-22
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
 | P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Broad patch is -20.9% c1; isolation finds draft-QKV alone -14.4% while target-QKV median is -1.1% | Existing-backend switching exhausted; negative result retained | Implement graph-friendly RDNA/fused draft kernel; candidate must beat stock c1 |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
+| P0 | Target RMSNorm + TP-local QKV | `opt/eagle-rmsnorm-qkv` | Real gfx1100 op is correct and graph-safe, but exact-segment median gain is only 0.3-4.0% for M=1..5 | Rejected; reproducible patch retained | No cell met the pre-declared ≥8% component gate |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
@@ -41,6 +42,12 @@ Exact-shape isolation closes the remaining threshold question. Target+draft QKV 
 The profile shows roughly 1,610 RMSNorm reductions per ten steps plus many BF16/FP32 copies and elementwise kernels, but a source/runtime audit narrows the missing work. `Qwen3NextRMSNorm(hidden_states, residual)` already uses native fused-add RMSNorm; dense Qwen3.8 MLP already feeds a merged gate/up projection into `SiluAndMul`; and full attention already has a fused gated split + QK-RMSNorm + partial RoPE path. The disabled compile flags are quantization/fusion passes, not evidence that these model-level fusions are absent.
 
 The actionable boundaries are RMSNorm+QKV/GDN projection, post-attention RMSNorm+gate/up projection, and EAGLE auxiliary hidden-state gather/projection/concatenation. For the 48 GDN layers, fused state update/convolution/norm is likely higher value than another generic MLP activation kernel.
+
+### `opt/eagle-rmsnorm-qkv`: target full-attention fusion
+
+This branch implements one opt-in boundary: residual-add input RMSNorm fused into the production gfx1100 `wvSplitK` prologue for the TP-local QKV projection. It reuses the persistent GEMM body rather than moving the full 5120x7168 matrix multiply into a generic kernel. A real ROCm CMake/Ninja build passes, along with 45 CPU/reference/fake cases, 26 real-GPU correctness cases, BF16/FP16 HIP Graph capture and replay, and `torch.compile(fullgraph=True)`. Updated residuals are bitwise identical; maximum QKV absolute errors are 0.001953125 (FP16) and 0.015625 (BF16).
+
+The exact stock segment (`fused_add_rms_norm` + `wvSplitK`) takes 0.109-0.118 ms. The fused operator improves its median by only 0.3-4.0% across M=1..5, with no cell meeting the pre-declared 8% gate. Do not promote or spend same-pair service time on A/B. The eliminated norm launch and intermediate traffic are too small relative to QKV compute; prioritize the larger gfx1100 GDN decode, attention, or MLP boundaries instead.
 
 ### `fix/eagle-dynamic-n`: scheduler/graph correctness
 

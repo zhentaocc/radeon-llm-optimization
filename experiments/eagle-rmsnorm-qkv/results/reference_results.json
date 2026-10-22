@@ -1,0 +1,8 @@
+{
+  "fullgraph_fake_cases": 1,
+  "reference_cases": 26,
+  "shape_and_fake_cases": 18,
+  "status": "pass",
+  "total_cases": 45,
+  "tp_local_qkv_layout": [7168, 5120]
+}

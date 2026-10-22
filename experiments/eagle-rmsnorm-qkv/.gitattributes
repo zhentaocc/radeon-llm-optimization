@@ -1,0 +1,2 @@
+# Unified-diff context uses a single leading space by definition.
+vllm-v0.29.0.patch -whitespace
