@@ -6,13 +6,13 @@ Updated: 2026-10-22
 
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
-| P0 | Strict no-async baseline | `exp/baseline-noasync` | Async baseline and EAGLE matrix complete; identical-scheduler baseline running | Running | 12/12 clean cells complete |
+| P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
 | P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | `wvSplitK_hf_sml` is ~54% of classified rank-0 kernel time in the target profile | Planned | ≥10% decode throughput gain, no matrix regression |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Thousands of norm, copy and elementwise launches; fusion flags are disabled in current graph | Planned | ≥8% batch-1 TPOT improvement |
-| P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | `[1-4→3, 5-64→2]` fails with divide-by-zero in graph candidate generation | Root-caused | Engine starts and matches best static N within 3% |
+| P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
-| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | Static EAGLE captures graphs successfully but graph pool is ~7.3 GiB/rank | Planned | Recover KV capacity without >3% decode loss |
+| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | 11 deployed capture sizes cut graph memory 7.3→1.86 GiB/rank and raise KV tokens ~125K→272K; short-c1 median is −2.5%, c16 is neutral | Candidate; 16K gate running | Recover KV capacity without >3% decode loss |
 | P1 | TP communication / all-reduce | `opt/tp-communication` | Rank1 NCCL wait dominates eager profile; only PYNCCL is active | Planned | ≥10% TP2 decode gain or prove topology limit |
 | P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode` | Fused GDN MTP op is unavailable; Triton fallback is active | Planned | Fused path selected and ≥5% E2E gain |
 | P1 | Long-context attention/prefill | `opt/longctx-attention` | 16K batch16 baseline p99 E2E is ~604 s; EAGLE worsens residency pressure | Planned | ≥15% 16K throughput gain with p99 non-regression |
@@ -22,7 +22,7 @@ Updated: 2026-10-22
 
 ### `exp/baseline-noasync`: strict control
 
-The original target-only baseline used async scheduling, while the tested speculative path did not. The current EAGLE-vs-baseline table is operationally useful but not a strict algorithm-only A/B. A second 12-cell baseline with identical no-async scheduling is running. This branch owns the corrected comparison and becomes the reference for every optimization branch.
+The original target-only baseline used async scheduling, while the tested speculative path did not. The strict 12-cell no-async control is now complete and closely matches the earlier baseline: for example 20.78/70.58/160.87 tok/s at 128/128 c1/c4/c16 and 3.46/8.74/10.75 tok/s at 16K/256. The corrected comparison preserves every major conclusion, including the −58.5% EAGLE regression at 16K c16. This branch is the reference for every optimization branch.
 
 ### `opt/eagle-smallm-gemm`: draft and verify GEMM
 
@@ -42,11 +42,13 @@ The current compile configuration reports `fuse_norm_quant=false`, `fuse_act_qua
 
 ### `fix/eagle-dynamic-n`: scheduler/graph correctness
 
-The build accepts `num_speculative_tokens_per_batch_size=[(start,end,N), ...]` and automatically downgrades full graphs to piecewise graphs. A schedule of batch 1–4→N=3 and 5–64→N=2 fails during `profile_cudagraph_memory()`:
+The build accepts `num_speculative_tokens_per_batch_size=[(start,end,N), ...]` and automatically downgrades full graphs to piecewise graphs. The original batch 1–4→N=3 and 5–64→N=2 schedule failed during `profile_cudagraph_memory()`:
 
 `SpeculatorCudaGraphManager._init_candidates()` calls `round_up(num_tokens, decode_query_len)` with `decode_query_len=0`, causing `ZeroDivisionError`.
 
-The failure is deterministic on an otherwise healthy GPU pair and is independent of the earlier GPU6/7 PYNCCL issue. The fix branch should add EAGLE-aware query-length construction, reject non-positive candidate lengths, and add ROCm startup tests for mixed schedules.
+The failure was deterministic and came from applying target verification query-length expansion to the one-token draft model graph manager. The fix now guards that expansion with `decode_query_len > num_speculative_tokens`; a unit regression test passes in the v0.29.0 ROCm image, and the patched server starts successfully.
+
+Performance still fails the promotion gate. A conservative batch 1→N=3, batch 2–64→N=2 schedule reaches 35.33 tok/s for 128/128 c1 (+9.6% versus static N=2), but only 148.67 tok/s for c16 (−15.5% versus the same tuning control) and 29.55 tok/s for 512/512 c1 (−1.2% versus static N=3). Acceptance behavior is normal; the remaining loss is the dynamic feature forcing piecewise graph execution. Keep the correctness patch, but do not recommend dynamic N on W7900 until the graph path is optimized.
 
 ### `opt/longctx-routing`: workload-aware speculation
 
@@ -58,7 +60,9 @@ Draft TP2 changes N=3 throughput from 33.90 to 35.11 tok/s for 128/128 c1 (+3.6%
 
 ### `opt/eagle-hip-graph`: graph coverage and memory
 
-Static EAGLE3 already captures and replays HIP/CUDA graphs in this build; “add graph support” is therefore no longer the correct task. The actionable task is to reduce the capture set and memory footprint. The measured graph pool is about 7.3 GiB/rank, and available KV cache for N=3 is about 5.17 GiB/rank (124,769 tokens). Capture only deployed batch/N shapes, compare full versus piecewise graphs, and reclaim memory for long-context residency.
+Static EAGLE3 already captures and replays HIP/CUDA graphs in this build; “add graph support” is therefore no longer the correct task. Restricting capture sizes to `[1,2,4,8,16,24,32,40,48,56,64]` cuts graph capture time to 13–19 s and graph memory from about 7.3 to 1.85–1.87 GiB/rank. Available KV memory rises to 10.67 GiB and 272,391 tokens, or 8.31× theoretical 32K concurrency—about 2.18× the original token capacity.
+
+The initial throughput gate passes: 128/128 c1 is 31.67, 30.98, and 31.42 tok/s across three runs (median −2.5% versus the 32.24 static-N tuning control); 128/128 c16 reaches 200.30 tok/s on the repeat, matching the 197.91 full-matrix control; 512/512 c1 is 27.95 tok/s (+0.3%). A 16K/c16 residency test is running before final promotion.
 
 ### `opt/tp-communication`
 
