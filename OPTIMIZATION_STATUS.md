@@ -9,6 +9,7 @@ Updated: 2026-10-22
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
 | P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Broad patch is -20.9% c1; isolation finds draft-QKV alone -14.4% while target-QKV median is -1.1% | Existing-backend switching exhausted; negative result retained | Implement graph-friendly RDNA/fused draft kernel; candidate must beat stock c1 |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
+| P0 | RDNA3 SiLU-and-mul kernel mapping | `opt/eagle-silu-mul-rdna` | Stock is 5.17–7.06 us; all tiled Triton variants are 65.6–126.3% slower across target/draft widths, BF16/FP16, and M=1..16 | Negative result; service A/B skipped | Revisit only with native packed-kernel or projection-epilogue design |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
@@ -41,6 +42,14 @@ Exact-shape isolation closes the remaining threshold question. Target+draft QKV 
 The profile shows roughly 1,610 RMSNorm reductions per ten steps plus many BF16/FP32 copies and elementwise kernels, but a source/runtime audit narrows the missing work. `Qwen3NextRMSNorm(hidden_states, residual)` already uses native fused-add RMSNorm; dense Qwen3.8 MLP already feeds a merged gate/up projection into `SiluAndMul`; and full attention already has a fused gated split + QK-RMSNorm + partial RoPE path. The disabled compile flags are quantization/fusion passes, not evidence that these model-level fusions are absent.
 
 The actionable boundaries are RMSNorm+QKV/GDN projection, post-attention RMSNorm+gate/up projection, and EAGLE auxiliary hidden-state gather/projection/concatenation. For the 48 GDN layers, fused state update/convolution/norm is likely higher value than another generic MLP activation kernel.
+
+### `opt/eagle-silu-mul-rdna`: existing fused activation kernel
+
+The existing target trace records 640 BF16 activation launches per rank across ten target forwards: 64 calls at M=11 and 576 calls at M=1. Each target TP2 rank receives a local gate/up input width of 17,408 and produces width 8,704. The one-layer TP1 draft receives width 34,816 and produces width 17,408; the N=2 autoregressive proposer source executes two draft forwards per proposer step.
+
+The stock native kernel already uses 128-bit packed loads and stores but maps one token to one 1,024-thread workgroup. A two-dimensional Triton candidate split each row into 1,024/2,048/4,096-element tiles and swept four/eight warps. Across BF16/FP16, both target/draft widths, and M=1/2/3/4/8/16, stock takes 5.17–7.06 us while the fastest tiled configuration takes 11.63–11.78 us. All numerical and HIP graph checks pass, but the candidate is 65.6–126.3% slower. The installed AITER op cannot launch because its packaged `aiter_tensor_t` binding rejects the wrapper's converted object.
+
+This is a micro-validated negative result. Per the 10% promotion gate, no service A/B or production source patch is warranted. Future activation work must either improve the existing native packed kernel without multiplying workgroups, or fuse activation into a neighboring projection epilogue.
 
 ### `fix/eagle-dynamic-n`: scheduler/graph correctness
 

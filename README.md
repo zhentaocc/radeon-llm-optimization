@@ -13,6 +13,7 @@ The first tracked workload is Qwen3.8-27B with `amd/Qwen3.8-27B-EAGLE3-Full-Voca
 - Dynamic-N startup is fixed and covered by a regression test, but piecewise graph mode still loses 15.5% at c16, so static-N routing remains recommended.
 - HIP graph v1/v2 recover substantial KV capacity, but both fail promotion: v1 collapses on 16K/c16 and v2 loses 4.8% at c1 and 6.7% on long decode.
 - A shape-aware RDNA small-M dispatch passes microbenchmarks and 13 unit tests but loses 20.9% at c1 in strict same-GPU A/B; it is retained as a negative result, not a PR candidate.
+- A tiled RDNA3 SiLU-and-mul specialization is 65.6–126.3% slower than the existing packed native kernel across target/draft widths, BF16/FP16, and M=1..16; it stops at microbench and does not enter service A/B.
 
 See [OPTIMIZATION_STATUS.md](OPTIMIZATION_STATUS.md) for the live optimization table and detailed work items, and [reports/w7900-qwen38-eagle3.md](reports/w7900-qwen38-eagle3.md) for the benchmark report.
 

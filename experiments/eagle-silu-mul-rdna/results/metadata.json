@@ -1,0 +1,26 @@
+{
+  "torch": "2.12.0+git6bbd260",
+  "hip": "7.2.53211",
+  "triton": "3.7.1",
+  "device": "AMD Radeon Graphics",
+  "warmup": 50,
+  "inner": 500,
+  "repeats": 9,
+  "aiter_import_error": "",
+  "widths": {
+    "target_tp2": 8704,
+    "draft_tp1": 17408
+  },
+  "m_values": [
+    1,
+    2,
+    3,
+    4,
+    8,
+    16
+  ],
+  "dtypes": [
+    "bfloat16",
+    "float16"
+  ]
+}
