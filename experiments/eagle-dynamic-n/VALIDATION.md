@@ -1,29 +1,30 @@
 # Validation: EAGLE3 dynamic N startup fix
 
-## Reproducer
+## Reproducer and fix
 
 - Hardware: 2× Radeon Pro W7900D (`gfx1100`)
 - Runtime: vLLM 0.29.0, ROCm 7.2, target TP=2, draft TP=1
 - Model: Qwen3.8-27B + `amd/Qwen3.8-27B-EAGLE3-Full-Vocab`
-- Config: max N=3, schedule `[[1,4,3],[5,64,2]]`
+- Config: max N=3 with a mixed N=3/N=2 batch schedule
 
-Unpatched startup fails in `CudaGraphManager._init_candidates()` when the autoregressive draft manager derives `decode_query_len=0` and passes it to `round_up()`.
+Unpatched startup fails in `CudaGraphManager._init_candidates()` because dynamic target query-length expansion is also applied to the autoregressive draft graph manager. Its `decode_query_len=1` becomes zero and reaches `round_up()`.
 
-## Fix
-
-Apply dynamic query-length expansion only to graph managers whose query contains the maximum speculative tokens plus at least one newly sampled token. The per-step autoregressive draft manager always has `decode_query_len=1` and must retain that static shape.
+The fix applies expansion only when `decode_query_len > num_speculative_tokens`. The one-token draft manager retains its static shape.
 
 ## Verification
 
 | Check | Result |
 |---|---|
-| New CPU regression test in production vLLM image | 1 passed |
+| Unit regression test in production vLLM image | 1 passed |
 | Unpatched real service startup | Deterministic `ZeroDivisionError` |
-| Patched real W7900 service startup | Passed; OpenAI endpoint ready |
-| Patched graph capture | Completed; 7.78 GiB/rank graph pool |
-| 128/128 c1 | 36.05 tok/s |
-| 128/128 c16 | 153.64 tok/s |
-| 512/512 c1 | 30.20 tok/s |
+| Patched real W7900 service startup | Passed; endpoint ready |
+| Patched graph capture | Completed; 7.78 GiB/rank |
 
-For comparison, static N=3/TP1 produced 33.90, 164.97, and 29.90 tok/s for the same three cells; static N=2/TP1 produced 32.24, 175.86, and 27.86 tok/s. The fix is functionally valid. The first schedule improves low-batch performance but does not yet beat static N=2 at high batch, so schedule tuning continues separately from correctness.
+| Schedule | 128/128 c1 | 128/128 c16 | 512/512 c1 |
+|---|---:|---:|---:|
+| `[[1,4,3],[5,64,2]]` | 36.05 | 153.64 | 30.20 |
+| `[[1,1,3],[2,64,2]]` | 35.33 | 148.67 | 29.55 |
+| Static N=3/TP1 | 33.90 | 164.97 | 29.90 |
+| Static N=2/TP1 | 32.24 | 175.86 | 27.86 |
 
+Correctness is fixed, but performance is not ready for promotion. Dynamic N forces piecewise graph execution: the tighter schedule still loses 15.5% at c16 versus static N=2. Keep the patch and regression test, but deploy separate static-N replicas or request routing until the dynamic graph path recovers within 3% of static throughput.
