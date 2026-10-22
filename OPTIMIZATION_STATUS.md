@@ -7,6 +7,7 @@ Updated: 2026-10-22
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
 | P0 | Real-data ShareGPT/SpecBench/LongBench gate | `bench/w7900-realdata-eagle3` | 24 paired result rows complete; fixed-256 SpecBench is +86.0%/+31.2%/+52.1%, while 8K-16K LongBench is +170.6%/+34.7%/−44.4% at c1/c4/c16 | Complete | Same samples/tokens, zero failures, provenance and scripts recorded |
+| P0 | AgentX-derived 32K synthetic smoke | `bench/w7900-agentx-derived` | Non-official c1/c4 throughput is 2.958x/2.098x; c4 mean TTFT regresses 52.4% | Diagnostic only | Never use as an official submission or production gate; see the detailed report |
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
 | P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Broad patch is -20.9% c1; isolation finds draft-QKV alone -14.4% while target-QKV median is -1.1% | Existing-backend switching exhausted; negative result retained | Implement graph-friendly RDNA/fused draft kernel; candidate must beat stock c1 |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
@@ -20,6 +21,15 @@ Updated: 2026-10-22
 | P2 | KV-cache capacity/precision | `opt/kv-cache` | EAGLE model+graphs reduce available KV cache; long-context concurrency collapses | Planned | More resident 16K requests with accuracy gate |
 
 ## Detailed analysis
+
+### `bench/w7900-agentx-derived`: non-official 32K smoke
+
+The official AgentX corpus has 0/393 traces eligible at a 32K server limit, so
+this branch contains only a fixed-seed derived workload and locally calibrated
+synthetic acceptance. It improves c1/c4 throughput by 2.958x/2.098x, while c4
+mean TTFT regresses 52.4%. This is useful for decode optimization direction but
+cannot serve as an official or production gate. See
+[reports/w7900-agentx-derived-32k.md](reports/w7900-agentx-derived-32k.md).
 
 ### `bench/w7900-realdata-eagle3`: real-data validation
 

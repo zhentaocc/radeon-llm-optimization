@@ -17,13 +17,16 @@ The first tracked workload is Qwen3.8-27B with `amd/Qwen3.8-27B-EAGLE3-Full-Voca
 - Dynamic-N startup is fixed and covered by a regression test, but piecewise graph mode still loses 15.5% at c16, so static-N routing remains recommended.
 - HIP graph v1/v2 recover substantial KV capacity, but both fail promotion: v1 collapses on 16K/c16 and v2 loses 4.8% at c1 and 6.7% on long decode.
 - A shape-aware RDNA small-M dispatch passes microbenchmarks and 13 unit tests but loses 20.9% at c1 in strict same-GPU A/B; it is retained as a negative result, not a PR candidate.
+- The non-official AgentX-derived 32K synthetic smoke improves c1/c4 throughput by 2.958x/2.098x, but c4 mean TTFT regresses 52.4%; it is an optimization signal, not an official or production gate.
 
 See [OPTIMIZATION_STATUS.md](OPTIMIZATION_STATUS.md) for the live optimization
 table and detailed work items,
 [reports/w7900-qwen38-eagle3.md](reports/w7900-qwen38-eagle3.md) for the
 synthetic benchmark report, and
 [experiments/w7900-realdata-eagle3/](experiments/w7900-realdata-eagle3/) for
-the reproducible real-data matrix.
+the reproducible real-data matrix. The non-submittable AgentX-derived 32K smoke
+is documented in
+[reports/w7900-agentx-derived-32k.md](reports/w7900-agentx-derived-32k.md).
 
 ## Repository workflow
 

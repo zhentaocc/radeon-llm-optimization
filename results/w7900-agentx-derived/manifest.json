@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "classification": {
+    "workload": "agentx-derived-32k",
+    "calibration_kind": "local_calibration",
+    "official": false,
+    "submission_valid": false,
+    "warning": "Derived 32K optimization smoke with synthetic acceptance; not an official InferenceX AgentX result."
+  },
+  "model": {
+    "target": "Qwen3.8-27B",
+    "draft": "amd/Qwen3.8-27B-EAGLE3-Full-Vocab",
+    "num_speculative_tokens": 2,
+    "max_context_length": 32768
+  },
+  "official_agentx_feasibility": {
+    "dataset": "semianalysisai/cc-traces-weka-062126",
+    "dataset_revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+    "source_jsonl_sha256": "29b6a19e751ff5230771519aab755f80a0f43a4ba9cf96b72d3a6a437ec99276",
+    "tokenizer_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "eligible_traces": 0,
+    "total_traces": 393,
+    "peak_context_tokens": {
+      "minimum": 44048,
+      "p10": 95752,
+      "median": 226314,
+      "p90": 692567,
+      "maximum": 996579
+    },
+    "golden_curve_available_for_model_and_draft": false
+  },
+  "derived_dataset": {
+    "sha256": "74efbcb60cb9c0db8e313dba4c7351bba6646764052a50e4311945266f0e8668",
+    "seed": 20261022,
+    "server_context_limit": 32768,
+    "safety_headroom_tokens": 1024,
+    "effective_recorded_context_limit": 31744,
+    "max_retained_peak_context": 31574,
+    "source_traces_scanned": 393,
+    "selected_traces": 14,
+    "dropped_traces": 379,
+    "requests": 57,
+    "retained_branches": 0,
+    "output_policy": {
+      "streaming": true,
+      "ignore_eos": true,
+      "use_server_token_count": true,
+      "cache_bust": "first_turn_prefix"
+    },
+    "rule": "Keep each stream prefix before its first request above 31744 tokens; retain branches only when spawn/join dependencies remain; require at least two root requests; preserve event order, timing, and hashed IDs."
+  },
+  "speedbench_local_calibration": {
+    "dataset_revision": "fbd6dc64353a3153bf24252a113ebd6d2cff9dec",
+    "resolved_jsonl_sha256": "aec93f3086c5f0b2e239928e706caf61b2274dfe3a0ecdb10ae45a502f5522ca",
+    "embedded_part_sha256": "97f65503e3ec5ca75aca42fa8b05584a5db6510eac8018d4b0e528ec85183645",
+    "complement_part_sha256": "2d7e53d87eb5524e56fb26bf5a7411a578f35920c01e607428258b5597ee22be",
+    "manifest_sha256": "d8933192c7559afbe0a0ef3affbc7264d2f2612c3d390f51f4642c72e0f70119",
+    "source_revisions": {
+      "livecodebench": "0fe84c3912ea0c4d4a78037083943e8f0c4dd505",
+      "codecontests": "802411c3010cb00d1b05bad57ca77365a3c699d6"
+    },
+    "dataset_rows": 80,
+    "http_turns_successful": 89,
+    "http_turns_failed": 0,
+    "temperature": 0,
+    "output_sequence_length": 4096,
+    "concurrency": 1,
+    "seed": 20261022,
+    "accepted_tokens": 120008,
+    "drafts": 110868,
+    "draft_tokens": 221736,
+    "acceptance_length": 2.0824403795504565,
+    "acceptance_rate": 0.5412201897752282
+  },
+  "server": {
+    "target_tensor_parallel_size": 2,
+    "draft_tensor_parallel_size": 1,
+    "synthetic_acceptance": true,
+    "synthetic_acceptance_length": 2.08244037955,
+    "prefix_caching": false,
+    "startup_evidence_sha256": {
+      "final_metrics": "cdd38232d07607fbce9d855083b4246c86c128c14d97ff8a6dee260e7bd5a39b",
+      "inspect": "83f531e3e0faf19dc0aad80bbbffb1deb11c5b4d1a2d53cec8da14b9c71dc2b8",
+      "log": "2bb429c5c74e7eadfa791c6ef9cabffdbed50422e91b2da9f5e4021dcac65afa",
+      "run_config": "fa03a55ccf9f320b2bac7b4029f588a7da3dcc7fab0813a8a6127d32f9c377a4"
+    },
+    "stopped_after_test": true,
+    "gpu_4_5_released": true
+  },
+  "runs": {
+    "c1": {
+      "parameters": {"concurrency": 1, "send_duration_seconds": 60, "grace_period_seconds": 600, "seed": 20261022},
+      "baseline": {
+        "total_elapsed_seconds": 520.39393408,
+        "latency_ms": {"mean": 520393.934133, "p50": 520393.934133},
+        "ttft_ms": {"mean": 19085.198531, "p50": 19085.198531},
+        "itl_ms": {"mean": 362.2172945101156, "p50": 362.2172945101156},
+        "output_throughput_tokens_per_second": 2.6614186102233277,
+        "output_sequence_length": {"mean": 1385, "p50": 1385},
+        "requests": {"successful": 1, "failed": 0, "cancelled": 0},
+        "sessions": {"sent": 1, "completed": 1, "peak_open": 1},
+        "branches": {"spawned": 0, "completed": 0, "failed": 0},
+        "speculative_counters": null,
+        "evidence_sha256": {
+          "profile": "dee5a2630944e05c81aa7489b2eff46f79df474308aa736117ee71a2e2973ef8",
+          "server_metrics": "9cb14beb5a1ea66f2c470a9d4e6e78c1ea5e936b1a98e213d2641dca02ae8e47"
+        }
+      },
+      "candidate": {
+        "total_elapsed_seconds": 175.927723008,
+        "latency_ms": {"mean": 175927.723021, "p50": 175927.723021},
+        "ttft_ms": {"mean": 18822.485503, "p50": 18822.485503},
+        "itl_ms": {"mean": 113.51534502745663, "p50": 113.51534502745663},
+        "output_throughput_tokens_per_second": 7.872386794892702,
+        "output_sequence_length": {"mean": 1385, "p50": 1385},
+        "requests": {"successful": 1, "failed": 0, "cancelled": 0},
+        "sessions": {"sent": 1, "completed": 1, "peak_open": 1},
+        "branches": {"spawned": 0, "completed": 0, "failed": 0},
+        "speculative_counters": {"accepted_tokens": 713, "drafts": 672, "draft_tokens": 1344, "realized_acceptance_length": 2.0610119047619047, "realized_acceptance_rate": 0.5305059523809523},
+        "evidence_sha256": {
+          "profile": "52685a6b4446c4f903be98aa942da45644c5d21047c0b2f26de20ac4e039911e",
+          "records": "932f99470c7b1005ef18d5523610670ded8ee8ca6e1dc1892872e1ac08b41cdd",
+          "server_metrics": "868d4cb68fd38adcc3e8ac7616c53ba8bfe0af0fb5ee7474a601ddba12231497"
+        }
+      },
+      "comparison": {"elapsed_speedup": 2.957998461995305, "latency_speedup": 2.9579984620779864, "ttft_change_percent": -1.3765276141784688, "itl_speedup": 3.190910395616592, "throughput_speedup": 2.957966388546485}
+    },
+    "c4": {
+      "parameters": {"concurrency": 4, "send_duration_seconds": 60, "grace_period_seconds": 600, "seed": 20261022},
+      "baseline": {
+        "total_elapsed_seconds": 576.556451328,
+        "latency_ms": {"mean": 287015.5543626667, "p50": 159789.05727},
+        "ttft_ms": {"mean": 43279.990196666666, "p50": 48544.275716},
+        "itl_ms": {"mean": 487.73539804372166, "p50": 406.282355003876},
+        "output_throughput_tokens_per_second": 3.1115490032851305,
+        "output_sequence_length": {"mean": 598, "p50": 259},
+        "requests": {"successful": 3, "failed": 0, "cancelled": 0},
+        "sessions": {"sent": 2, "completed": 1, "released_still_open": 1, "peak_open": 3, "target_open": 4, "rootless_lanes": 1},
+        "branches": {"spawned": 1, "completed": 1, "failed": 0},
+        "speculative_counters": null,
+        "evidence_sha256": {
+          "profile": "187789f4a226781f4e35365268b54b9322aefadcc3e05c00e7af2dcebe40eb69",
+          "server_metrics": "d262c42c600f860cd1b81d30340cd6fb278d12dc5faf32da6c43b7160952b5eb"
+        }
+      },
+      "candidate": {
+        "total_elapsed_seconds": 274.799641344,
+        "latency_ms": {"mean": 180950.57406166664, "p50": 139379.090663},
+        "ttft_ms": {"mean": 65962.40406266667, "p50": 72388.743203},
+        "itl_ms": {"mean": 333.574949059895, "p50": 160.5442153100775},
+        "output_throughput_tokens_per_second": 6.528307459542234,
+        "output_sequence_length": {"mean": 598, "p50": 259},
+        "requests": {"successful": 3, "failed": 0, "cancelled": 0},
+        "sessions": {"sent": 2, "completed": 1, "released_still_open": 1, "peak_open": 3, "target_open": 4, "rootless_lanes": 1},
+        "branches": {"spawned": 1, "completed": 1, "failed": 0},
+        "speculative_counters": {"accepted_tokens": 929, "drafts": 865, "draft_tokens": 1730, "realized_acceptance_length": 2.0739884393063583, "realized_acceptance_rate": 0.5369942196531792},
+        "evidence_sha256": {
+          "profile": "603a984cbb6ac751ceef58a30212054dab5fb8d453bee8ff3b117550955c7a00",
+          "records": "2d44f512dde11c96db5c64e116a2591e2f6764ef0c1201a6f4d76603cbff3460",
+          "server_metrics": "45e4215a559726f13058dec727d0ee6e130e4034ca5bd3ec96006d05c415ece0"
+        }
+      },
+      "comparison": {"elapsed_speedup": 2.0980975393859937, "mean_latency_speedup": 1.5861544283625972, "p50_latency_speedup": 1.146434924420253, "mean_ttft_change_percent": 52.408546681572396, "p50_ttft_change_percent": 49.11900967788252, "mean_itl_speedup": 1.4621463614647705, "p50_itl_speedup": 2.5306570792300187, "throughput_speedup": 2.098089232292256}
+    }
+  },
+  "limitations": [
+    "Official AgentX eligibility at 32K is zero; the derived corpus changes the official distribution.",
+    "Synthetic acceptance is calibrated from local SPEED-Bench coding traffic, not derived AgentX traffic.",
+    "The 60-second send window produced only one completed c1 request and three completed c4 requests.",
+    "TTFT is dominated by long prefill and short-sample scheduling; no steady-state or official claim is made.",
+    "Raw traces, request records, and logs are excluded from Git and represented only by hashes."
+  ]
+}
