@@ -1,0 +1,157 @@
+diff --git a/csrc/rocm/ops.h b/csrc/rocm/ops.h
+index d4b2cd4..875c0d6 100644
+--- a/csrc/rocm/ops.h
++++ b/csrc/rocm/ops.h
+@@ -11,0 +12,6 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
++// Benchmark-only entry point used to sweep native HIP wvSplitK launch
++// parameters without changing the production dispatch.
++torch::Tensor wvSplitKSweep(const at::Tensor& in_a, const at::Tensor& in_b,
++                            const std::optional<at::Tensor>& in_bias,
++                            const int64_t CuCount, const int64_t config);
++
+diff --git a/csrc/rocm/torch_bindings.cpp b/csrc/rocm/torch_bindings.cpp
+index 92dbed7..a753e0d 100644
+--- a/csrc/rocm/torch_bindings.cpp
++++ b/csrc/rocm/torch_bindings.cpp
+@@ -32,0 +33,5 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
++  rocm_ops.def(
++      "wvSplitKSweep(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount, "
++      "int config) -> Tensor");
++  rocm_ops.impl("wvSplitKSweep", torch::kCUDA, &wvSplitKSweep);
++
+diff --git a/csrc/rocm/skinny_gemms.cu b/csrc/rocm/skinny_gemms.cu
+index 615cdab..a4f5f7e 100644
+--- a/csrc/rocm/skinny_gemms.cu
++++ b/csrc/rocm/skinny_gemms.cu
+@@ -1180,0 +1181,14 @@ int mindiv(int N, int div1, int div2) {
++// A bounded form of mindiv for benchmark configurations with fewer than 16
++// waves per group. It selects the smallest active wave count that does not
++// increase the number of output-row rounds.
++int mindiv_bounded(int N, int div1, int max_div2) {
++  const int base_rounds = (N + div1 * max_div2 - 1) / (div1 * max_div2);
++  int active = max_div2;
++  for (int waves = max_div2 - 1; waves >= 1; --waves) {
++    const int rounds = (N + div1 * waves - 1) / (div1 * waves);
++    if (rounds != base_rounds) break;
++    active = waves;
++  }
++  return active;
++}
++
+@@ -1326,0 +1341,116 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
++torch::Tensor wvSplitKSweep(const at::Tensor& in_a, const at::Tensor& in_b,
++                            const std::optional<at::Tensor>& in_bias,
++                            const int64_t CuCount, const int64_t config) {
++  const auto M_in = in_a.size(0);
++  const auto K_in = in_a.size(1);
++  const auto N_in = in_b.size(0);
++  const auto Kap_in = in_a.stride(0);
++  const auto Kbp_in = in_b.stride(0);
++  const auto Bx_in =
++      (in_bias.has_value() && in_bias->numel() > 0)
++          ? (in_bias->sizes().size() == 2) ? in_bias->size(1) : in_bias->size(0)
++          : 1;
++  const auto By_in = (in_bias.has_value() && in_bias->numel() > 0 &&
++                      in_bias->sizes().size() == 2)
++                         ? in_bias->size(0)
++                         : 1;
++
++  TORCH_CHECK(in_a.dtype() == in_b.dtype());
++  TORCH_CHECK(K_in % 8 == 0, "k % 8 == 0");
++  TORCH_CHECK(in_a.dtype() == torch::kFloat16 ||
++              in_a.dtype() == torch::kBFloat16);
++  TORCH_CHECK(N_in == 1 || N_in == 3,
++              "Stage-A sweep only supports token M=1 or M=3");
++  TORCH_CHECK(config >= 0 && config <= 9, "config must be in [0, 9]");
++
++  const int max_lds_len = get_lds_size() / 2;
++  TORCH_CHECK(Kbp_in * N_in <= max_lds_len,
++              "Stage-A sweep requires activations to fit in LDS");
++
++  auto out_c = torch::empty(
++      {N_in, M_in},
++      torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++#define WVSPLITK_SWEEP_LAUNCH(_WVPRGRP, _YTILE, _UNRL, _N, _GRID_MUL)       \
++  {                                                                         \
++    TORCH_CHECK(M_in % _YTILE == 0, "output rows must divide YTILE");       \
++    const int grid_count = static_cast<int>(CuCount) * _GRID_MUL;           \
++    dim3 grid(grid_count);                                                   \
++    dim3 block(32, _WVPRGRP);                                               \
++    const int active_waves =                                                \
++        mindiv_bounded(M_in, grid_count * _YTILE, _WVPRGRP);                \
++    wvSplitK_hf_sml_<fptype, 32, _YTILE, _WVPRGRP, 8, _UNRL, _N>           \
++        <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
++                                     By_in, af4, bf4, biasf4, c,            \
++                                     active_waves, grid_count);             \
++  }
++
++#define WVSPLITK_SWEEP_CONFIG(_N)                                           \
++  switch (config) {                                                         \
++    case 0: /* exact stock parameters for the Stage-A token counts */       \
++      if constexpr (_N == 1)                                                \
++        WVSPLITK_SWEEP_LAUNCH(16, 2, 2, _N, 1)                              \
++      else                                                                  \
++        WVSPLITK_SWEEP_LAUNCH(16, 4, 2, _N, 1)                              \
++      break;                                                                \
++    case 1: /* half waves, same 48-block grid */                            \
++      if constexpr (_N == 1)                                                \
++        WVSPLITK_SWEEP_LAUNCH(8, 2, 2, _N, 1)                               \
++      else                                                                  \
++        WVSPLITK_SWEEP_LAUNCH(8, 4, 2, _N, 1)                               \
++      break;                                                                \
++    case 2: /* half waves, two sequential blocks per CU */                  \
++      if constexpr (_N == 1)                                                \
++        WVSPLITK_SWEEP_LAUNCH(8, 2, 2, _N, 2)                               \
++      else                                                                  \
++        WVSPLITK_SWEEP_LAUNCH(8, 4, 2, _N, 2)                               \
++      break;                                                                \
++    case 3: /* quarter waves, four sequential blocks per CU */              \
++      if constexpr (_N == 1)                                                \
++        WVSPLITK_SWEEP_LAUNCH(4, 2, 2, _N, 4)                               \
++      else                                                                  \
++        WVSPLITK_SWEEP_LAUNCH(4, 4, 2, _N, 4)                               \
++      break;                                                                \
++    case 4:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(16, 2, 2, _N, 1)                                \
++      break;                                                                \
++    case 5:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(8, 2, 2, _N, 2)                                 \
++      break;                                                                \
++    case 6:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(16, 4, 1, _N, 1)                                \
++      break;                                                                \
++    case 7:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(8, 4, 1, _N, 2)                                 \
++      break;                                                                \
++    case 8:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(16, 1, 4, _N, 1)                                \
++      break;                                                                \
++    case 9:                                                                 \
++      WVSPLITK_SWEEP_LAUNCH(8, 1, 4, _N, 2)                                 \
++      break;                                                                \
++  }
++
++  AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitKSweep", [&] {
++    using fptype = typename scalar<scalar_t>::type;
++    fptype* af4 = reinterpret_cast<fptype*>(in_a.data_ptr());
++    const fptype* bf4 = reinterpret_cast<const fptype*>(in_b.data_ptr());
++    const fptype* biasf4 =
++        (in_bias.has_value() && in_bias->numel() > 0)
++            ? reinterpret_cast<const fptype*>(in_bias->data_ptr())
++            : nullptr;
++    fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
++    if (N_in == 1) {
++      WVSPLITK_SWEEP_CONFIG(1)
++    } else {
++      WVSPLITK_SWEEP_CONFIG(3)
++    }
++  });
++
++#undef WVSPLITK_SWEEP_CONFIG
++#undef WVSPLITK_SWEEP_LAUNCH
++  return out_c;
++}
++
