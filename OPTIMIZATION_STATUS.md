@@ -7,12 +7,12 @@ Updated: 2026-10-22
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
-| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | `wvSplitK_hf_sml` is ~54% of classified rank-0 kernel time in the target profile | Planned | ≥10% decode throughput gain, no matrix regression |
+| P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Shape sweep finds blanket `wvSplitK` loses 7–23% on QKV/O/target-down but wins 1.7–3.0× on large MLP; shape-aware patch passes 13 tests | Patch ready; E2E gate blocked by host PYNCCL state | ≥10% decode throughput gain, no matrix regression |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Thousands of norm, copy and elementwise launches; fusion flags are disabled in current graph | Planned | ≥8% batch-1 TPOT improvement |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
 | P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
-| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | 11 deployed capture sizes cut graph memory 7.3→1.86 GiB/rank and raise KV tokens ~125K→272K; short-c1 median is −2.5%, c16 is neutral | Candidate; 16K gate running | Recover KV capacity without >3% decode loss |
+| P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | V1 cuts graph memory 7.3→1.86 GiB/rank and raises KV ~125K→272K, but misses verification shape 3 and loses 4.4% c1 versus same-period control; v2 covers all batch/verify shapes | V2 pending PYNCCL recovery; 16K gate running | Recover KV capacity without >3% decode loss |
 | P1 | TP communication / all-reduce | `opt/tp-communication` | Rank1 NCCL wait dominates eager profile; only PYNCCL is active | Planned | ≥10% TP2 decode gain or prove topology limit |
 | P1 | GDN fused decode for gfx1100 | `opt/gdn-fused-decode` | Fused GDN MTP op is unavailable; Triton fallback is active | Planned | Fused path selected and ≥5% E2E gain |
 | P1 | Long-context attention/prefill | `opt/longctx-attention` | 16K batch16 baseline p99 E2E is ~604 s; EAGLE worsens residency pressure | Planned | ≥15% 16K throughput gain with p99 non-regression |
@@ -28,13 +28,16 @@ The original target-only baseline used async scheduling, while the tested specul
 
 The workload is dominated by small-M linear algebra during autoregressive decode. The existing target profile records 2,314 `wvSplitK_hf_sml` launches and about 286 ms on rank0 across ten profiled steps, roughly 54% of classified rank-0 kernel time. EAGLE adds one 5,120-hidden, 17,408-intermediate draft layer and verifies multiple tokens per target step, creating a new family of M=1/2/3/5/7 shapes.
 
-Plan:
+Direct W7900 microbenchmarks show that the current blanket `n<=5` dispatch is wrong. `wvSplitK` is about 1.7× faster for target MLP-up, 3.0× for draft MLP-up, 1.24–1.34× for draft MLP-down, and 1.76–1.94× for the TP-local LM head. It is 7–23% slower for target/draft QKV and O projections and 8–16% slower for target MLP-down. A threshold sweep places the crossover between output dimensions 10,240 and 11,264 for K=5120.
 
-- build a shape manifest for target decode, draft decode, and verification;
-- benchmark hipBLASLt/Tensile/AITER and current split-K kernels per shape;
-- add batch- and N-aware dispatch;
-- evaluate persistent/fused linear paths to reduce launch overhead;
-- gate on the full matrix, not microbenchmarks alone.
+The branch patch keeps CDNA behavior unchanged and, on RDNA, uses `wvSplitK` only when `max(m,k)>=11264`, limits LLMM1 to single-token K≤4096, and otherwise falls through to torch/hipBLASLt. The exact v0.29.0 test file passes 13/13 cases in the production ROCm image. End-to-end service validation awaits a host/GPU reset: PyNCCL fails during communicator initialization, while the torch.distributed fallback loads the model and then fails at its first all-reduce with the same `hipIpcGetMemHandle` error.
+
+Remaining gate:
+
+- launch patched and stock services on the same healthy GPU pair;
+- repeat 128/128 c1/c16 and 512/512 c1 at least three times;
+- profile kernel counts to confirm small projections moved off `wvSplitK`;
+- gate on the full matrix before promotion.
 
 ### `opt/eagle-fusion`: norm and MLP fusion
 
@@ -62,7 +65,9 @@ Draft TP2 changes N=3 throughput from 33.90 to 35.11 tok/s for 128/128 c1 (+3.6%
 
 Static EAGLE3 already captures and replays HIP/CUDA graphs in this build; “add graph support” is therefore no longer the correct task. Restricting capture sizes to `[1,2,4,8,16,24,32,40,48,56,64]` cuts graph capture time to 13–19 s and graph memory from about 7.3 to 1.85–1.87 GiB/rank. Available KV memory rises to 10.67 GiB and 272,391 tokens, or 8.31× theoretical 32K concurrency—about 2.18× the original token capacity.
 
-The initial throughput gate passes: 128/128 c1 is 31.67, 30.98, and 31.42 tok/s across three runs (median −2.5% versus the 32.24 static-N tuning control); 128/128 c16 reaches 200.30 tok/s on the repeat, matching the 197.91 full-matrix control; 512/512 c1 is 27.95 tok/s (+0.3%). A 16K/c16 residency test is running before final promotion.
+The first set misses shape `3`, which is the N=2 verification shape for c1. Its 128/128 c1 results are 31.67, 30.98, and 31.42 tok/s; a same-period default repeat reaches 32.88, so the median loss is 4.4% and fails the gate. C16 is 200.30 versus 204.23 tok/s (−1.9%), and 512/512 c1 is 27.95 tok/s (+0.3% versus the earlier tuning control).
+
+V2 captures every batch size 1–16 plus each verification multiple through 48 (`1..16,18,21,...,48,56,64`). That should restore full-graph execution throughout the deployed range while still reducing the 54-shape default. New TP2 launches are blocked by a host HIP IPC failure under both PyNCCL and torch.distributed and require a host/GPU reset. The v1 16K/c16 residency test remains in progress on the already-running service.
 
 ### `opt/tp-communication`
 

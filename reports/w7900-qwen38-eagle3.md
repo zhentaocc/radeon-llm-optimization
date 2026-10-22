@@ -10,7 +10,7 @@ Status: EAGLE3 functional/performance matrix, parameter sweep, and strict identi
 - The optimization is workload-sensitive. For 16K/256 it is +128% at c1 but −21% at c4 and −58% at c16; speculation must be disabled or routed away for high-concurrency long-prefill traffic.
 - N=3 is best for low concurrency; N=2 is best for high concurrency. N=5/7 consistently lose because additional draft/verification cost grows faster than accepted-token length.
 - Draft TP2 gives a narrow +3.6% win for short c1, but loses 1–3% on long output/high batch. Draft TP1 remains the default.
-- Static EAGLE3 already uses HIP graphs. Restricting capture to 11 deployed shapes cuts graph memory from ~7.3 to ~1.86 GiB/rank and raises KV capacity from ~125K to 272K tokens with ≤2.5% median low-batch throughput loss.
+- Static EAGLE3 already uses HIP graphs. An 11-shape prototype cuts graph memory from ~7.3 to ~1.86 GiB/rank and raises KV capacity from ~125K to 272K tokens, but misses the c1 verification shape and needs one more iteration before promotion.
 - Dynamic per-batch N now starts after a one-line graph-manager guard and a regression test, but it is not performance-ready: piecewise graph mode loses 15.5% at c16 versus static N=2.
 
 ## Environment and methodology
@@ -70,7 +70,15 @@ N=7 reaches accepted length 3.02 for short c1 but is still 22% slower than N=3. 
 
 For the deployed maximum concurrency 16 and static N=2, the capture set `[1,2,4,8,16,24,32,40,48,56,64]` covers the active decode/verification shapes while allowing larger prefill shapes to use piecewise execution. It reduces graph capture time to 13–19 seconds and memory to 1.85–1.87 GiB/rank. Available KV memory becomes 10.67 GiB and 272,391 tokens, equivalent to 8.31× theoretical 32K concurrency.
 
-Throughput regression results are 31.67/30.98/31.42 tok/s across three 128/128 c1 runs (median −2.5% versus the 32.24 tuning control), 200.30 tok/s for the repeated c16 run (neutral versus the 197.91 matrix control), and 27.95 tok/s for 512/512 c1 (+0.3%). The 16K/c16 residency gate is still running; pending that result, this is the strongest configuration-only optimization found so far.
+The prototype reaches 31.67/30.98/31.42 tok/s across three 128/128 c1 runs, but a same-period default repeat is 32.88 tok/s, so the median loss is 4.4%. The cause is deterministic: static N=2 verifies three tokens for c1 and shape `3` was omitted, forcing piecewise execution. C16 is within 1.9% of its same-period control and 512/512 c1 is neutral.
+
+V2 covers every active batch size 1–16 and every N=2 verification multiple through 48 (`1..16,18,21,...,48,56,64`). New TP2 launches are blocked by `hipIpcGetMemHandle failed: invalid argument`: PyNCCL fails during communicator initialization, and the torch.distributed fallback loads the model but fails at its first all-reduce. The v1 16K/c16 residency gate continues on the already-running service; after a host/GPU reset, promotion requires v2 to stay within 3% at c1/c4/c16.
+
+### Shape-aware small-M GEMM dispatch
+
+The target profile's 2,314 `wvSplitK_hf_sml` launches account for about 54% of classified rank-0 kernel time, but direct W7900 microbenchmarks show that the current `n<=5` rule is too broad. Large MLP/LM-head shapes benefit strongly from `wvSplitK` (1.24–3.0×), while target/draft QKV, O projection, and target MLP-down are 7–23% faster through torch/hipBLASLt. The crossover for K=5120 is between output dimensions 10,240 and 11,264.
+
+A v0.29.0 patch now uses `wvSplitK` on RDNA only when `max(m,k)>=11264`, restricts LLMM1 to single-token K≤4096, and leaves CDNA unchanged. The production ROCm image passes all 13 affected unit tests. Full server A/B is pending a host/GPU reset; both PyNCCL and torch.distributed reproduce the same HIP IPC failure independently of the patch.
 
 ## Dynamic N: correctness fixed, performance rejected
 

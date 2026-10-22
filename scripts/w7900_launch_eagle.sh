@@ -11,6 +11,8 @@ batch_schedule="${7:-}"
 cudagraph_patch="${8:-}"
 cudagraph_capture_sizes="${9:-}"
 use_skinny_gemm="${10:-1}"
+disable_pynccl="${11:-0}"
+linear_utils_patch="${12:-}"
 
 target=/nvme0/data/zihaomu/bigssd/llamafactroy_workspace/models/Qwen3.8-27B
 draft=/nvme0/data/zhenchen/models/Qwen3.8-27B-EAGLE3-Full-Vocab
@@ -23,7 +25,10 @@ fi
 cache=/nvme0/data/zhenchen/vllm-cache/$container
 patch_mount=()
 if [[ -n "$cudagraph_patch" ]]; then
-    patch_mount=(-v "$cudagraph_patch:/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/cudagraph_utils.py:ro")
+    patch_mount+=(-v "$cudagraph_patch:/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/cudagraph_utils.py:ro")
+fi
+if [[ -n "$linear_utils_patch" ]]; then
+    patch_mount+=(-v "$linear_utils_patch:/opt/venv/lib/python3.12/site-packages/vllm/model_executor/layers/utils.py:ro")
 fi
 compilation_args=()
 if [[ -n "$cudagraph_capture_sizes" ]]; then
@@ -47,6 +52,7 @@ docker run -d \
     --ulimit memlock=-1:-1 \
     -e "HIP_VISIBLE_DEVICES=$gpus" \
     -e "VLLM_ROCM_USE_SKINNY_GEMM=$use_skinny_gemm" \
+    -e "VLLM_DISABLE_PYNCCL=$disable_pynccl" \
     -v "$target:/models/Qwen3.8-27B:ro" \
     -v "$draft:/models/draft:ro" \
     -v "$cache:/root/.cache/vllm" \
@@ -80,6 +86,8 @@ num_speculative_tokens_per_batch_size=$batch_schedule
 cudagraph_patch=$cudagraph_patch
 cudagraph_capture_sizes=$cudagraph_capture_sizes
 VLLM_ROCM_USE_SKINNY_GEMM=$use_skinny_gemm
+VLLM_DISABLE_PYNCCL=$disable_pynccl
+linear_utils_patch=$linear_utils_patch
 speculative_config=$spec_config
 EOF
 
