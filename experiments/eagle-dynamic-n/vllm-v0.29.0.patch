@@ -1,0 +1,82 @@
+From 1c2de808c4f9152597618b91e0d618d551291b88 Mon Sep 17 00:00:00 2001
+From: "Chen, Todd" <zhenchen@amd.com>
+Date: Wed, 21 Oct 2026 21:40:34 -0500
+Subject: [PATCH] Fix dynamic EAGLE draft cudagraph query lengths
+
+---
+ tests/v1/cudagraph/test_cudagraph_manager.py | 31 ++++++++++++++++++++
+ vllm/v1/worker/gpu/cudagraph_utils.py        | 14 +++++++--
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/cudagraph/test_cudagraph_manager.py b/tests/v1/cudagraph/test_cudagraph_manager.py
+index c622954..f913857 100644
+--- a/tests/v1/cudagraph/test_cudagraph_manager.py
++++ b/tests/v1/cudagraph/test_cudagraph_manager.py
+@@ -364,6 +364,37 @@ def test_dynamic_spec_decode_shared_token_count_stays_reachable(monkeypatch):
+         ), desc
+ 
+ 
++def test_dynamic_spec_decode_keeps_single_token_draft_manager_static(monkeypatch):
++    """A per-step draft manager must not apply target verification lengths.
++
++    Autoregressive draft decode always processes one token per request.  With
++    max K=3, applying a target schedule containing K=2 would otherwise derive
++    ``decode_query_len = 2 + (1 - 3) = 0`` and fail while building graph
++    candidates.
++    """
++    manager = _make_spec_decode_manager(
++        monkeypatch,
++        decode_query_len=1,
++        capture_sizes=[1, 2, 4, 8],
++        num_speculative_tokens=3,
++        dynamic_spec_schedule=[(1, 4, 3), (5, 8, 2)],
++    )
++
++    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
++    assert full_descs
++    assert {desc.uniform_token_count for desc in full_descs} == {1}
++
++    for num_reqs in range(1, 9):
++        desc = manager.dispatch(
++            num_reqs=num_reqs,
++            num_tokens=num_reqs,
++            uniform_token_count=1,
++            num_active_loras=0,
++        )
++        assert desc.cg_mode == CUDAGraphMode.FULL
++        assert desc.uniform_token_count == 1
++
++
+ @pytest.mark.parametrize(
+     "decode_query_len,capture_sizes",
+     [(1, [1, 2, 4, 8]), (2, [2, 4, 8, 16]), (8, [8, 16, 32, 64])],
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index f6564da..4eedb1b 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -206,10 +206,20 @@ class CudaGraphManager:
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
+-        if (
++        # Dynamic speculative lengths only change graph shapes for routines
++        # whose query contains the speculative tokens plus at least one newly
++        # sampled token.  The autoregressive draft decode manager executes one
++        # draft token per step (`decode_query_len == 1`) regardless of the
++        # configured target verification length.  Applying the schedule to
++        # that manager would subtract max N from 1 and can create a zero or
++        # negative query length (for example max N=3 with scheduled N=2).
++        uses_variable_query_len = (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+-        ):
++            and self.decode_query_len
++            > self.vllm_config.num_speculative_tokens
++        )
++        if uses_variable_query_len:
+             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
+             # _per_step. Recover num_new_sampled_tokens_per_step
+             # from the values the manager already has.
+-- 
+2.55.0
+
