@@ -10,7 +10,9 @@ The first tracked workload is Qwen3.8-27B with `amd/Qwen3.8-27B-EAGLE3-Full-Voca
 - Static `N=2`, draft TP=1 is the best general configuration measured so far.
 - Static `N=3`, draft TP=2 is narrowly best for short, batch-1 traffic.
 - EAGLE3 helps decode-heavy and low-concurrency workloads, but is harmful for 16K context at batch 4/16.
-- Dynamic N exists in the tested vLLM build but EAGLE3 initialization currently fails in graph candidate generation when the schedule mixes N=3 and N=2.
+- Dynamic-N startup is fixed and covered by a regression test, but piecewise graph mode still loses 15.5% at c16, so static-N routing remains recommended.
+- HIP graph v1/v2 recover substantial KV capacity, but both fail promotion: v1 collapses on 16K/c16 and v2 loses 4.8% at c1 and 6.7% on long decode.
+- A shape-aware RDNA small-M dispatch passes microbenchmarks and 13 unit tests but loses 20.9% at c1 in strict same-GPU A/B; it is retained as a negative result, not a PR candidate.
 
 See [OPTIMIZATION_STATUS.md](OPTIMIZATION_STATUS.md) for the live optimization table and detailed work items, and [reports/w7900-qwen38-eagle3.md](reports/w7900-qwen38-eagle3.md) for the benchmark report.
 
