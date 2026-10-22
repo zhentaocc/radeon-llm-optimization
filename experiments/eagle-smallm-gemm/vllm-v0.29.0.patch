@@ -1,0 +1,131 @@
+From 6562a7efd4817912962d63ac8ff03d5ab4cd42e2 Mon Sep 17 00:00:00 2001
+From: "Chen, Todd" <zhenchen@amd.com>
+Date: Wed, 21 Oct 2026 22:36:00 -0500
+Subject: [PATCH] ROCm: use shape-aware RDNA skinny GEMM dispatch
+
+---
+ .../layers/test_rocm_unquantized_gemm.py      | 57 ++++++++++++++++++-
+ vllm/model_executor/layers/utils.py           | 15 ++++-
+ 2 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/tests/model_executor/layers/test_rocm_unquantized_gemm.py b/tests/model_executor/layers/test_rocm_unquantized_gemm.py
+index 66b4af7..95daec6 100644
+--- a/tests/model_executor/layers/test_rocm_unquantized_gemm.py
++++ b/tests/model_executor/layers/test_rocm_unquantized_gemm.py
+@@ -19,7 +19,7 @@ from vllm.model_executor.layers import utils
+ 
+ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
+     x = torch.randn(1, 64, dtype=torch.float16)
+-    weight = torch.randn(128, 64, dtype=torch.float16)
++    weight = torch.randn(11264, 64, dtype=torch.float16)
+ 
+     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+@@ -44,7 +44,7 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
+ 
+ def test_rocm_unquantized_gemm_makes_skinny_activation_contiguous(monkeypatch):
+     x = torch.randn(64, 4, dtype=torch.float16).t()
+-    weight = torch.randn(128, 64, dtype=torch.float16)
++    weight = torch.randn(11264, 64, dtype=torch.float16)
+     assert x.shape == (4, 64)
+     assert x.stride() == (1, 4)
+ 
+@@ -134,7 +134,7 @@ def test_rocm_unquantized_gemm_rejects_unsupported_skinny_layouts(
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+ def test_rocm_unquantized_gemm_noncontiguous_activation_real_kernel(monkeypatch, dtype):
+     x = torch.randn(64, 4, device="cuda", dtype=dtype).t()
+-    weight = torch.randn(128, 64, device="cuda", dtype=dtype)
++    weight = torch.randn(11264, 64, device="cuda", dtype=dtype)
+     assert x.stride() == (1, 4)
+ 
+     monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+@@ -176,6 +176,57 @@ def test_rocm_unquantized_gemm_gfx1x_n_gt_5_falls_back(monkeypatch):
+     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+ 
+ 
++@pytest.mark.parametrize("n", [2, 4, 5])
++def test_rocm_unquantized_gemm_gfx1x_small_shape_falls_back(monkeypatch, n):
++    x = torch.randn(n, 64, dtype=torch.float16)
++    weight = torch.randn(128, 64, dtype=torch.float16)
++
++    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
++    monkeypatch.setattr(utils.rocm_aiter_ops, "is_tgemm_enabled", lambda: False)
++    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
++
++    wvsplitk_mock = MagicMock()
++    llmm1_mock = MagicMock()
++    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
++    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
++
++    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
++    ref = torch.nn.functional.linear(x, weight, None)
++
++    wvsplitk_mock.assert_not_called()
++    llmm1_mock.assert_not_called()
++    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
++
++
++def test_rocm_unquantized_gemm_gfx1x_large_k_skips_llmm1(monkeypatch):
++    x = torch.randn(1, 5120, dtype=torch.float16)
++    weight = torch.randn(128, 5120, dtype=torch.float16)
++
++    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
++    monkeypatch.setattr(utils.rocm_aiter_ops, "is_tgemm_enabled", lambda: False)
++    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
++    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
++
++    wvsplitk_mock = MagicMock()
++    llmm1_mock = MagicMock()
++    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
++    monkeypatch.setattr(utils.ops, "LLMM1", llmm1_mock)
++
++    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
++    ref = torch.nn.functional.linear(x, weight, None)
++
++    wvsplitk_mock.assert_not_called()
++    llmm1_mock.assert_not_called()
++    assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
++
++
+ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
+     x = torch.randn(1024, 16, dtype=torch.float16).t()
+     weight = torch.randn(256, 1024, dtype=torch.float16)
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index caa52f2..a17da53 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -330,11 +330,22 @@ def rocm_unquantized_gemm_impl(
+         # The skinny kernels assume contiguous K elements. A shape-preserving
+         # reshape can retain a transposed activation's non-contiguous strides.
+         x_view = x.reshape(-1, x.size(-1)).contiguous()
+-        if m > 8 and 0 < n <= 5:
++        # On RDNA3, wvSplitK is slower than hipBLASLt for the smaller
++        # projection shapes used by hybrid attention models. W7900 tuning
++        # places the crossover between 10K and 11K on the larger weight
++        # dimension; retain the existing behavior on CDNA.
++        rdna_wvsplitk_profitable = not on_gfx1x() or max(m, k) >= 11264
++        if m > 8 and 0 < n <= 5 and rdna_wvsplitk_profitable:
+             cu_count = num_compute_units()
+             out = ops.wvSplitK(weight, x_view, cu_count, bias)
+             return out.reshape(*x.shape[:-1], weight.shape[0])
+-        elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
++        elif (
++            m % 4 == 0
++            and n == 1
++            and k <= 8192
++            and bias is None
++            and (not on_gfx1x() or k <= 4096)
++        ):
+             out = ops.LLMM1(weight, x_view, 4)
+             return out.reshape(*x.shape[:-1], weight.shape[0])
+ 
+-- 
+2.55.0
+
