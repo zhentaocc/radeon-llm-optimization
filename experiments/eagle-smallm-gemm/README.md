@@ -30,4 +30,4 @@ The output-dimension sweep places the W7900 crossover between 10,240 and 11,264 
 - Source commit: `6562a7e` in the local vLLM branch `opt/eagle-smallm-gemm`.
 - Patch: `vllm-v0.29.0.patch`.
 
-The full EAGLE server A/B is blocked temporarily because new TP2 communicators on GPU0/1 and GPU2/3 fail before model load with PYNCCL `HIP invalid argument`; those pairs completed earlier matrices successfully. Do not attribute that host-state failure to this patch.
+The full EAGLE server A/B is blocked temporarily because new TP2 communicators on GPU0/1 and GPU2/3 fail with `hipIpcGetMemHandle failed: invalid argument`; those pairs completed earlier matrices successfully. Disabling PyNCCL lets model loading finish, but torch.distributed hits the identical HIP IPC failure at its first all-reduce during memory profiling. Recovery requires a host/GPU driver reset. Do not attribute this host-state failure to the patch.
