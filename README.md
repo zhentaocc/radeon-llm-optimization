@@ -1,5 +1,14 @@
 # Radeon LLM Optimization
 
+## Current branch: eager-mode KV-capacity experiment
+
+Status: **configured / E2E infrastructure-blocked**. This branch records an
+exact stock EAGLE N=2 experiment whose only runtime delta is
+`--enforce-eager`. GPU0/1 starts were invalidated by external shared-host
+workloads, and the clean GPU2/3 formal start failed in PYNCCL before model
+execution. No capacity or performance claim is made. See
+[`experiments/eagle-eager-capacity`](experiments/eagle-eager-capacity/README.md).
+
 Reproducible performance engineering for vLLM speculative decoding on AMD Radeon GPUs.
 
 The first tracked workload is Qwen3.8-27B with `amd/Qwen3.8-27B-EAGLE3-Full-Vocab` on 2× Radeon Pro W7900D (`gfx1100`, ROCm 7.2, vLLM 0.29.0). The repository keeps raw-result indexes, launch/benchmark scripts, optimization hypotheses, validated deltas, and PR-ready branches separate.

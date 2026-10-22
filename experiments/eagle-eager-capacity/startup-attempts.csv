@@ -1,0 +1,5 @@
+attempt,gpu_pair,purpose,preflight,outcome,stage,external_competition,requests,action
+1,"0,1",diagnostic,clean,pynccl_failed,TP2_PYNCCL_initialization,false,0,preserved_log_and_retried_once
+2,"0,1",diagnostic_retry,initially_clean,invalidated,model_loading,true,0,preserved_contamination_evidence_and_stopped_own_container
+3,"0,1",formal,clean_twice_then_contended,invalidated,model_loading,true,0,preserved_contamination_evidence_and_stopped_own_container
+4,"2,3",formal,clean_twice,pynccl_failed,TP2_PYNCCL_initialization,false,0,preserved_log_and_stopped_no_retry
