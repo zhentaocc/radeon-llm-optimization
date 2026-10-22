@@ -6,11 +6,12 @@ Updated: 2026-10-22
 
 | Priority | Optimization | Branch | Current evidence | Status | Exit criterion |
 |---|---|---|---|---|---|
+| P0 | Real-data ShareGPT/SpecBench/LongBench gate | `bench/w7900-realdata-eagle3` | 24 paired result rows complete; fixed-256 SpecBench is +86.0%/+31.2%/+52.1%, while 8K-16K LongBench is +170.6%/+34.7%/−44.4% at c1/c4/c16 | Complete | Same samples/tokens, zero failures, provenance and scripts recorded |
 | P0 | Strict no-async baseline | `exp/baseline-noasync` | 12/12 cells complete; results closely match the earlier async baseline and preserve every major EAGLE conclusion | Complete | 12/12 clean cells complete |
 | P0 | Draft/target small-M GEMM dispatch | `opt/eagle-smallm-gemm` | Broad patch is -20.9% c1; isolation finds draft-QKV alone -14.4% while target-QKV median is -1.1% | Existing-backend switching exhausted; negative result retained | Implement graph-friendly RDNA/fused draft kernel; candidate must beat stock c1 |
 | P0 | EAGLE fused RMSNorm/projection/MLP | `opt/eagle-fusion` | Audit confirms residual+RMSNorm, SiluAndMul, and QK-norm/RoPE split are already fused; remaining targets are RMSNorm+projection and EAGLE auxiliary-state preparation | Scoped | ≥8% batch-1 TPOT improvement |
 | P0 | Dynamic N for EAGLE3 | `fix/eagle-dynamic-n` | Startup crash fixed; batch-1-only N=3 gives 35.33 tok/s, but c16 falls to 148.67 tok/s because dynamic mode forces piecewise graphs | Correctness fixed; perf rejected | Recover static N=2 c16 throughput within 3% before enabling |
-| P0 | Long-context admission/routing | `opt/longctx-routing` | N=2 changes 16K throughput by +128%/−21%/−58% at batch 1/4/16 | Config-ready | Disable speculation or route separately at batch ≥4 |
+| P0 | Long-context admission/routing | `opt/longctx-routing` | Real 8K-16K LongBench changes throughput by +170.6%/+34.7%/−44.4% at c1/c4/c16; c16 p50 TTFT rises 112.9% | Config-ready | Route by active-token/KV pressure; preserve the measured c4 win |
 | P1 | Draft TP policy | `opt/draft-tp-policy` | TP2 is +3.6% for short c1, −3.1% for short c16, −1.3% for 512/512 c1 | Analyzed | Policy encoded and regression tested |
 | P1 | Reduce HIP graph memory/capture set | `opt/eagle-hip-graph` | V1 raises KV to 272K but 16K/c16 falls to ~1.70 tok/s; v2 leaves 210,751 tokens but loses 4.8% c1 and 6.7% long decode | V1/V2 rejected; redesign scoped | Recover KV capacity without >3% decode loss or long-context collapse |
 | P1 | TP communication / all-reduce | `opt/tp-communication` | Rank1 NCCL wait dominates eager profile; only PYNCCL is active | Planned | ≥10% TP2 decode gain or prove topology limit |
@@ -19,6 +20,35 @@ Updated: 2026-10-22
 | P2 | KV-cache capacity/precision | `opt/kv-cache` | EAGLE model+graphs reduce available KV cache; long-context concurrency collapses | Planned | More resident 16K requests with accuracy gate |
 
 ## Detailed analysis
+
+### `bench/w7900-realdata-eagle3`: real-data validation
+
+The paired real-data gate covers the existing 82,577-row ShareGPT conversation
+set, official SpecBench, and pinned LongBench `gov_report` text selected by
+target-tokenizer rendered length from 8K to 16K. It contains 18 natural-EOS
+cases plus six fixed-256 SpecBench cases. Every request completed, and every
+paired case has identical input-length lists and input-token totals.
+
+Fixed-output SpecBench removes natural-EOS length drift from the primary
+throughput comparison. EAGLE output throughput improves from 18.52/59.65/140.84
+to 34.44/78.24/214.16 tok/s at c1/c4/c16, or +85.98%/+31.16%/+52.06%.
+Acceptance is 62.69-66.58%, with mean accepted length 2.254-2.332. ShareGPT
+also remains positive across the matrix at +28.47% to +91.29%.
+
+LongBench exposes the capacity boundary. At c1/c4, output throughput improves
+from 4.74/12.95 to 12.83/17.44 tok/s (+170.55%/+34.68%). At c16 it falls from
+26.48 to 14.73 tok/s (-44.36%) even though p50 TPOT improves 12.05%, because
+p50 TTFT grows from 70.82 to 150.75 seconds. EAGLE startup uses 6.63 GiB graph
+memory versus 2.56 GiB and leaves 150,241 versus 366,273 KV-cache tokens. This
+confirms that the production guard must be based on resident/queued tokens, not
+request count alone.
+
+Reproduction assets, provenance, complete derived tables, and artifact hashes
+are in [experiments/w7900-realdata-eagle3/](experiments/w7900-realdata-eagle3/).
+All 24 detailed result JSONs are included after whitelist-only sanitization,
+preserving lengths, timings, aggregates, and acceptance counters while removing
+generated text and error payloads. Unsanitized JSON/logs remain only on the
+benchmark host and in the recorded private Windows backup.
 
 ### `exp/baseline-noasync`: strict control
 
@@ -55,6 +85,12 @@ Performance still fails the promotion gate. A conservative batch 1→N=3, batch 
 ### `opt/longctx-routing`: workload-aware speculation
 
 Static N=2 is not safe as a universal switch. For 16K/256, throughput changes versus the existing baseline are +128% at batch1, −21% at batch4, and −58% at batch16. The immediate production action is application-level routing: enable EAGLE for low-concurrency/decode-heavy traffic and route high-concurrency long-prefill traffic to a target-only replica. Engine-level dynamic N remains blocked by the issue above.
+
+The real-data LongBench run refines that rule: with 8K-16K official
+`gov_report` prompts and 512-token outputs, EAGLE is +170.55% at c1 and
++34.68% at c4, but -44.36% at c16. Use active token residency and KV headroom
+for admission; c4 is still beneficial in the measured real distribution, so a
+hard `batch >= 4` cutoff is too conservative.
 
 ### `opt/draft-tp-policy`: TP1 versus TP2
 

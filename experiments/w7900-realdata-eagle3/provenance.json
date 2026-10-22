@@ -1,0 +1,57 @@
+{
+  "run_id": "zhenchen-realdata-20261022",
+  "platform": "W7900D",
+  "model": {
+    "served_name": "Qwen3.8-27B",
+    "target_path": "/nvme0/data/zihaomu/bigssd/llamafactroy_workspace/models/Qwen3.8-27B",
+    "target_config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "draft_path": "/nvme0/data/zhenchen/models/Qwen3.8-27B-EAGLE3-Full-Vocab",
+    "draft_config_sha256": "9591e1e97ce17cd723e5c401617d00ec8aa7b2cd1faa7eb2205eb22187bcfb0b"
+  },
+  "runtime": {
+    "image": "specbench:vllm-0.29.0-rocm723-gfx1100",
+    "image_id": "sha256:8bb2ff76f14bb1092ca566724b2dcd8c483f82703fa6b373983ae4a3c44ad0cd",
+    "baseline": "target TP2, GPU 2,3, no speculative decoding",
+    "eagle_n2": "target TP2, draft TP1, num_speculative_tokens=2, GPU 4,5",
+    "max_model_len": 32768,
+    "gpu_memory_utilization": 0.88,
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 16384,
+    "prefix_caching": false,
+    "async_scheduling": false
+  },
+  "datasets": {
+    "sharegpt_short": {
+      "path": "/home/zhenchen/speculative-bench-fca1ed6/profile/dataset/sharegpt_custom_qwen35.jsonl",
+      "rows": 82577,
+      "sha256": "5ab0839247f3b0856c81c5b9f02085c34a24d50c986810629413ed97dff224fa"
+    },
+    "longbench_gov_report": {
+      "parquet_repository": "https://huggingface.co/datasets/giulio98/LongBench",
+      "parquet_revision": "2683f3bf148120ec1e18f25c88642c0d379326b1",
+      "parquet_sha256": "184c389e2543aa808d65a785d89c9a225d7d394041a953e475837c61cdb81df2",
+      "official_prompt_repository": "https://github.com/THUDM/LongBench",
+      "official_prompt_revision": "2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+      "selection": "target chat-template rendered tokens in [8192,16384], enable_thinking=false, seed=42",
+      "eligible_rows": 86,
+      "output_cap": 512,
+      "derived_jsonl_sha256": "35f9c65238f2aa50e7623b78330110f09afe764bf9d9b0ee0155ed939416c01c"
+    },
+    "specbench": {
+      "repository": "https://github.com/hemingkx/Spec-Bench",
+      "revision": "fd2c1cd7d2201ef71db4c5f4e455008f017967bf",
+      "rows": 480,
+      "sha256": "4b6d33e79484f9841c487ee87d1cf6aa8c6066f61d5d482ff09e5a007fafdf04",
+      "output_cap": 256
+    }
+  },
+  "sampling": {
+    "seed": 42,
+    "temperature": 0,
+    "enable_thinking": false,
+    "ignore_eos": false,
+    "request_rate": "inf",
+    "concurrency": [1, 4, 16]
+  }
+}
+
