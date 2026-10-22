@@ -1,0 +1,2 @@
+candidate,stock_launches,fused_launches,stock_kernels,fused_kernel,status
+layer0-input-prep,3,1,rms_norm+rms_norm+cat,_fused_two_aux_rms_norm_kernel,micro-validated_E2E-pending
