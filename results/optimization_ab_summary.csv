@@ -1,0 +1,7 @@
+optimization,workload,concurrency,candidate_tok_s,control_tok_s,delta_percent,decision
+hip_graph_v2,128/128,1,31.33,32.92,-4.8,reject
+hip_graph_v2,128/128,16,173.11,173.60,-0.3,pass_cell
+hip_graph_v2,512/512,1,26.23,28.12,-6.7,reject
+smallm_shape_dispatch,128/128,1,26.04,32.92,-20.9,reject
+smallm_shape_dispatch,128/128,16,169.43,173.60,-2.4,pass_cell
+smallm_shape_dispatch,512/512,1,24.39,28.12,-13.3,reject
